@@ -9,3 +9,4 @@ accounts/
 *.db-shm
 *.db-wal
 *.db-blobs
+.deps/
