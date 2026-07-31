@@ -1,0 +1,11 @@
+echobot
+test
+*.o
+*.ppu
+*.rsj
+accounts/
+.env
+*.db
+*.db-shm
+*.db-wal
+*.db-blobs

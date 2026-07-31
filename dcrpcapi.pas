@@ -1,0 +1,241 @@
+unit dcrpcapi;
+
+{$mode objfpc}{$H+}
+
+interface
+
+uses
+  Classes, SysUtils, fpjson, dcrpc, dcjson, dctypes, dctransport;
+
+type
+  TAccountIdArray = array of TAccountId;
+  TMsgIdArray = array of TMsgId;
+
+  TEventResult = record
+    AccId: TAccountId;
+    Event: TJSONData;
+  end;
+
+  TDCClient = class
+  private
+    FRpc: TRpc;
+  public
+    constructor Create(ATransport: TDCTransport);
+    destructor Destroy; override;
+    function GetSystemInfo: TJSONObject;
+    function GetAllAccountIds: TAccountIdArray;
+    function AddAccount: TAccountId;
+    function IsConfigured(AccId: TAccountId): Boolean;
+    procedure BatchSetConfig(AccId: TAccountId; const Keys: array of string; const Vals: array of TOptionString);
+    procedure Configure(AccId: TAccountId);
+    function GetConfig(AccId: TAccountId; const Key: string): TOptionString;
+    procedure StartIoForAllAccounts;
+    function GetNextEvent: TEventResult;
+    function GetNextMsgs(AccId: TAccountId): TMsgIdArray;
+    procedure SetConfig(AccId: TAccountId; const Key: string; const Val: TOptionString);
+    function GetMessage(AccId: TAccountId; MsgId: TMsgId): TMsgSnapshot;
+    function MiscSendTextMessage(AccId: TAccountId; ChatId: TChatId; const Text: string): TMsgId;
+    property Rpc: TRpc read FRpc;
+  end;
+
+  function GetAccount(Client: TDCClient): TAccountId;
+
+implementation
+
+function GetAccount(Client: TDCClient): TAccountId;
+var
+  Ids: TAccountIdArray;
+begin
+  Ids := Client.GetAllAccountIds;
+  if Length(Ids) = 0 then
+    Result := Client.AddAccount
+  else
+    Result := Ids[0];
+end;
+
+constructor TDCClient.Create(ATransport: TDCTransport);
+begin
+  inherited Create;
+  FRpc := TRpc.Create(ATransport);
+end;
+
+destructor TDCClient.Destroy;
+begin
+  FRpc.Free;
+  inherited Destroy;
+end;
+
+function TDCClient.GetSystemInfo: TJSONObject;
+var
+  Res: TJSONData;
+begin
+  Res := FRpc.CallResult('get_system_info', TJSONArray.Create);
+  Result := Res as TJSONObject;
+end;
+
+function TDCClient.GetAllAccountIds: TAccountIdArray;
+var
+  Res: TJSONData;
+  Arr: TJSONArray;
+  i: Integer;
+begin
+  Res := FRpc.CallResult('get_all_account_ids', TJSONArray.Create);
+  Arr := Res as TJSONArray;
+  SetLength(Result, Arr.Count);
+  for i := 0 to Arr.Count - 1 do
+    Result[i] := Arr.Items[i].AsQWord;
+  Res.Free;
+end;
+
+function TDCClient.AddAccount: TAccountId;
+var
+  Res: TJSONData;
+begin
+  Res := FRpc.CallResult('add_account', TJSONArray.Create);
+  Result := Res.AsQWord;
+  Res.Free;
+end;
+
+function TDCClient.IsConfigured(AccId: TAccountId): Boolean;
+var
+  Params: TJSONArray;
+  Res: TJSONData;
+begin
+  Params := TJSONArray.Create;
+  Params.Add(AccId);
+  Res := FRpc.CallResult('is_configured', Params);
+  Result := Res.AsBoolean;
+  Res.Free;
+end;
+
+procedure TDCClient.BatchSetConfig(AccId: TAccountId; const Keys: array of string; const Vals: array of TOptionString);
+var
+  Params: TJSONArray;
+  ConfigObj: TJSONObject;
+  i: Integer;
+begin
+  ConfigObj := TJSONObject.Create;
+  for i := Low(Keys) to High(Keys) do
+    ConfigObj.Add(Keys[i], dcjson.OptionToJSON(Vals[i]));
+  Params := TJSONArray.Create;
+  Params.Add(AccId);
+  Params.Add(ConfigObj);
+  FRpc.Call('batch_set_config', Params);
+end;
+
+procedure TDCClient.Configure(AccId: TAccountId);
+var
+  Params: TJSONArray;
+begin
+  Params := TJSONArray.Create;
+  Params.Add(AccId);
+  FRpc.Call('configure', Params);
+end;
+
+function TDCClient.GetConfig(AccId: TAccountId; const Key: string): TOptionString;
+var
+  Params: TJSONArray;
+  Res: TJSONData;
+begin
+  Params := TJSONArray.Create;
+  Params.Add(AccId);
+  Params.Add(Key);
+  Res := FRpc.CallResult('get_config', Params);
+  Result := JSONToOption(Res);
+  Res.Free;
+end;
+
+procedure TDCClient.StartIoForAllAccounts;
+begin
+  FRpc.Call('start_io_for_all_accounts', TJSONArray.Create);
+end;
+
+function TDCClient.GetNextEvent: TEventResult;
+var
+  Params: TJSONArray;
+  Res: TJSONData;
+  Obj: TJSONObject;
+  EvData: TJSONData;
+begin
+  Params := TJSONArray.Create;
+  Res := FRpc.CallResult('get_next_event', Params);
+  Obj := Res as TJSONObject;
+  Result.AccId := Obj.Elements['contextId'].AsQWord;
+  EvData := Obj.Find('event');
+  if Assigned(EvData) then
+    Result.Event := EvData.Clone
+  else
+    Result.Event := nil;
+  Res.Free;
+end;
+
+function TDCClient.GetNextMsgs(AccId: TAccountId): TMsgIdArray;
+var
+  Params: TJSONArray;
+  Res: TJSONData;
+  Arr: TJSONArray;
+  i: Integer;
+begin
+  Params := TJSONArray.Create;
+  Params.Add(AccId);
+  Res := FRpc.CallResult('get_next_msgs', Params);
+  Arr := Res as TJSONArray;
+  SetLength(Result, Arr.Count);
+  for i := 0 to Arr.Count - 1 do
+    Result[i] := Arr.Items[i].AsQWord;
+  Res.Free;
+end;
+
+procedure TDCClient.SetConfig(AccId: TAccountId; const Key: string; const Val: TOptionString);
+var
+  Params: TJSONArray;
+begin
+  Params := TJSONArray.Create;
+  Params.Add(AccId);
+  Params.Add(Key);
+  Params.Add(dcjson.OptionToJSON(Val));
+  FRpc.Call('set_config', Params);
+end;
+
+function TDCClient.GetMessage(AccId: TAccountId; MsgId: TMsgId): TMsgSnapshot;
+var
+  Params: TJSONArray;
+  Res: TJSONData;
+  Obj: TJSONObject;
+  D: TJSONData;
+begin
+  Params := TJSONArray.Create;
+  Params.Add(AccId);
+  Params.Add(MsgId);
+  Res := FRpc.CallResult('get_message', Params);
+  Obj := Res as TJSONObject;
+  D := Obj.Find('id');
+  if Assigned(D) then Result.Id := D.AsQWord else Result.Id := 0;
+  D := Obj.Find('chatId');
+  if Assigned(D) then Result.ChatId := D.AsQWord else Result.ChatId := 0;
+  D := Obj.Find('fromId');
+  if Assigned(D) then Result.FromId := D.AsQWord else Result.FromId := 0;
+  D := Obj.Find('text');
+  if Assigned(D) then Result.Text := D.AsString else Result.Text := '';
+  D := Obj.Find('isBot');
+  if Assigned(D) then Result.IsBot := D.AsBoolean else Result.IsBot := False;
+  D := Obj.Find('isInfo');
+  if Assigned(D) then Result.IsInfo := D.AsBoolean else Result.IsInfo := False;
+  Res.Free;
+end;
+
+function TDCClient.MiscSendTextMessage(AccId: TAccountId; ChatId: TChatId; const Text: string): TMsgId;
+var
+  Params: TJSONArray;
+  Res: TJSONData;
+begin
+  Params := TJSONArray.Create;
+  Params.Add(AccId);
+  Params.Add(ChatId);
+  Params.Add(Text);
+  Res := FRpc.CallResult('misc_send_text_message', Params);
+  Result := Res.AsQWord;
+  Res.Free;
+end;
+
+end.
