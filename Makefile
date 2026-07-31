@@ -1,15 +1,32 @@
 .PHONY: deps build run clean clean-deps help
 
 RPC_VERSION ?= v2.57.0
-# FPC points to either an fpc binary in PATH (default) or to an
-# fpcupdeluxe-style tree root (then we use $FPC/bin/<target>/fpc).
-# FPC_UNITS is a space-separated list of units paths; when empty,
-# fpc's own search paths are used.
-FPC         ?= fpc
-FPC_UNITS   ?=
 
-# If FPC looks like a directory, append /bin/<host-triple>/fpc.
-FPC_BIN := $(if $(wildcard $(FPC)/bin/.*),$(wildcard $(FPC)/bin/*/fpc),$(FPC))
+# FPC: by default we look for fpcupdeluxe in a few well-known locations
+# and prefer its compiler over the system fpc (which on many distros is
+# too old and lacks fcl-process). Override on the command line to point
+# at any other fpc binary or fpcupdeluxe tree root.
+FPCUP_CANDIDATES := \
+  /home/alexander/fpcupdeluxe_trunc/fpc \
+  $(HOME)/fpcupdeluxe_trunc/fpc \
+  /opt/fpcupdeluxe*/fpc
+FPC_ROOT := $(firstword $(wildcard $(FPCUP_CANDIDATES)))
+FPC      ?= $(if $(FPC_ROOT),$(FPC_ROOT),fpc)
+
+# If FPC is a directory (fpcupdeluxe tree root), pick the inner fpc.
+FPC_BIN := $(if $(wildcard $(FPC)/bin/.*),$(firstword $(wildcard $(FPC)/bin/*/fpc)),$(FPC))
+
+# FPC_UNITS: when using an fpcupdeluxe tree, point at its units dirs so
+# fcl-process etc. resolve. When using system fpc, rely on its own
+# search paths.
+FPC_UNITS ?= $(if $(FPC_ROOT),\
+  $(FPC_ROOT)/units/$(shell uname -m | sed 's/x86_64/x86_64-linux/;s/aarch64/aarch64-linux/')/rtl \
+  $(FPC_ROOT)/units/$(shell uname -m | sed 's/x86_64/x86_64-linux/;s/aarch64/aarch64-linux/')/rtl-objpas \
+  $(FPC_ROOT)/units/$(shell uname -m | sed 's/x86_64/x86_64-linux/;s/aarch64/aarch64-linux/')/fcl-json \
+  $(FPC_ROOT)/units/$(shell uname -m | sed 's/x86_64/x86_64-linux/;s/aarch64/aarch64-linux/')/fcl-base \
+  $(FPC_ROOT)/units/$(shell uname -m | sed 's/x86_64/x86_64-linux/;s/aarch64/aarch64-linux/')/fcl-process \
+  $(FPC_ROOT)/units/$(shell uname -m | sed 's/x86_64/x86_64-linux/;s/aarch64/aarch64-linux/')/pthreads \
+,)
 
 help:
 	@echo "Targets:"
@@ -19,11 +36,15 @@ help:
 	@echo "  make clean      - remove built binary and intermediate files"
 	@echo "  make clean-deps - also remove downloaded deltachat-rpc-server"
 	@echo ""
-	@echo "Variables (override on the command line):"
-	@echo "  RPC_VERSION=v2.58.0 make deps"
-	@echo "  FPC=/path/to/fpcupdeluxe_trunc/fpc FPC_UNITS='/path/rtl /path/fcl-base ...' make build"
+	@echo "Detected:"
+	@echo "  FPC_ROOT  = $(FPC_ROOT)"
+	@echo "  FPC       = $(FPC)"
+	@echo "  FPC_BIN   = $(FPC_BIN)"
+	@echo "  FPC_UNITS = $(FPC_UNITS)"
 	@echo ""
-	@echo "Effective FPC binary: $(FPC_BIN)"
+	@echo "Override on the command line, e.g.:"
+	@echo "  RPC_VERSION=v2.58.0 make deps"
+	@echo "  FPC=/some/other/fpc make build"
 
 # ---- dependency: deltachat-rpc-server ----
 deps:
