@@ -43,7 +43,31 @@ Behavior notes:
   (session-sticky routing keeps the KV cache warm on the Hub).
 - Rate limits (429) and transient errors are retried with a short backoff
   honoring `Retry-After`; client errors (401/400) are logged and skipped.
+- If the model returns null/empty content (e.g. a reasoning model that
+  spent the whole token budget), the request is retried once, then the
+  error is logged with the raw response snippet.
 - With no `LLM_API_KEY` the bot falls back to the plain echo behavior.
+
+## Authorization
+
+When `BOT_AUTH_CODE` is set, the bot only talks to contacts that have
+authorized themselves once by sending:
+
+    /start <кодовая фраза>
+
+Authorized contact ids are stored in `accounts/authorized.txt`
+(override with `BOT_AUTH_FILE`), so access survives restarts. The file
+is gitignored and travels with the `accounts/` directory when you
+deploy elsewhere.
+
+| Variable        | Description                                     | Default                    |
+|-----------------|-------------------------------------------------|----------------------------|
+| `BOT_AUTH_CODE` | Secret phrase; empty = authorization disabled   | *(empty = open bot)*       |
+| `BOT_AUTH_FILE` | File with authorized contact ids (one per line) | `accounts/authorized.txt`  |
+
+Unauthorized contacts: `/start` alone gets a hint, a wrong code gets a
+rejection, any other message is ignored silently. Authorized contacts
+keep the usual behavior (`/start` → `работаю`, everything else → LLM).
 
 ## Build & run
 

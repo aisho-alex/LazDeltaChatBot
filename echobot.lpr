@@ -12,6 +12,7 @@ uses
   dcevents,
   dcjson,
   dcllm,
+  dcauth,
   fpjson;
 
 var
@@ -19,6 +20,7 @@ var
   Client: TDCClient;
   Bot: TDCBot;
   LLM: TDCLLM;
+  Auth: TAuthStore;
   AccId: TAccountId;
   SysInfo: TJSONObject;
   AddrOpt: TOptionString;
@@ -35,7 +37,7 @@ end;
 procedure HandleNewMsg(AccId: TAccountId; MsgId: TMsgId);
 var
   Snap: TMsgSnapshot;
-  Text, Reply: string;
+  Text, Reply, Code: string;
 begin
   Snap := Client.GetMessage(AccId, MsgId);
   WriteLn(Format('DEBUG msg id=%d chat=%d from=%d isBot=%s isInfo=%s text="%s"',
@@ -45,12 +47,36 @@ begin
   if Snap.FromId <= ContactLastSpecial then Exit;
   Text := Trim(Snap.Text);
   if Text = '' then Exit;
+
+  // --- authorization gate ---
+  if Auth.Enabled and not Auth.IsAuthorized(Snap.FromId) then
+  begin
+    if Copy(Text, 1, 7) = '/start ' then
+    begin
+      Code := Trim(Copy(Text, 8, Length(Text) - 7));
+      if Code = Auth.Code then
+      begin
+        Auth.Authorize(Snap.FromId);
+        WriteLn(Format('DEBUG authorized contact %d', [Snap.FromId]));
+        Client.MiscSendTextMessage(AccId, Snap.ChatId, '✅ Авторизация пройдена. Добро пожаловать!');
+      end
+      else
+        Client.MiscSendTextMessage(AccId, Snap.ChatId, '🔒 Неверный код. Доступ запрещён.');
+    end
+    else if Text = '/start' then
+      Client.MiscSendTextMessage(AccId, Snap.ChatId, '🔒 Отправь /start <кодовая фраза> для авторизации')
+    else
+      WriteLn(Format('DEBUG ignoring message from unauthorized contact %d', [Snap.FromId]));
+    Exit;
+  end;
+
   if Text = '/start' then
   begin
     WriteLn('DEBUG replying with "работаю" to /start');
     Client.MiscSendTextMessage(AccId, Snap.ChatId, 'работаю');
     Exit;
   end;
+
   if not LLM.IsConfigured then
   begin
     WriteLn('WARN: LLM not configured (set LLM_API_KEY), ignoring message');
@@ -80,6 +106,7 @@ begin
   Client := TDCClient.Create(Transport);
   Bot := TDCBot.Create(Client);
   LLM := TDCLLM.Create;
+  Auth := TAuthStore.Create;
 
   AccId := GetAccount(Client);
 
@@ -91,6 +118,11 @@ begin
     WriteLn('LLM: ' + LLM.Model + ' @ ' + LLM.BaseURL)
   else
     WriteLn('LLM: not configured (set LLM_API_KEY) — bot replies only to /start');
+
+  if Auth.Enabled then
+    WriteLn(Format('Auth: enabled (%d authorized contacts, file %s)', [Auth.Count, Auth.Path]))
+  else
+    WriteLn('Auth: disabled (set BOT_AUTH_CODE) — bot is open');
 
   Bot.OnInfo(@LogEvent);
   Bot.OnWarning(@LogEvent);
@@ -114,6 +146,7 @@ begin
   Bot.Run;
 
   Bot.Free;
+  Auth.Free;
   LLM.Free;
   Client.Free;
   Transport.Close;

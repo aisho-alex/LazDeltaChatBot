@@ -259,41 +259,61 @@ begin
   end;
 end;
 
+function SafeStr(J: TJSONData; const Path: string): string;
+var
+  D: TJSONData;
+begin
+  D := J.FindPath(Path);
+  if (D <> nil) and not (D is TJSONNull) then
+    Result := D.AsString
+  else
+    Result := 'null';
+end;
+
 function TDCLLM.Complete(ChatId: UInt64; const UserText: string): string;
 var
   Body: string;
   Resp: string;
   J: TJSONData;
   Ch: TJSONData;
-  FR: TJSONData;
+  Content: string;
+  FReason: string;
+  Attempt: Integer;
 begin
   if not IsConfigured then
     raise Exception.Create('LLM not configured: set LLM_API_KEY');
   Body := BuildRequestBody(ChatId, UserText);
-  Resp := DoPost(Body);
-  J := GetJSON(Resp);
-  try
-    Ch := J.FindPath('choices[0].message.content');
-    if Assigned(Ch) then
-      Result := Ch.AsString
-    else
-      raise Exception.Create('LLM response has no choices[0].message.content: ' + Copy(Resp, 1, 300));
-    if Result = '' then
-    begin
-      // e.g. a reasoning model spent the whole token budget on reasoning_content
-      FR := J.FindPath('choices[0].finish_reason');
-      if Assigned(FR) then
-        raise Exception.Create('LLM returned empty content (finish_reason=' +
-          FR.AsString + '); increase LLM_MAX_TOKENS')
+  Content := '';
+  for Attempt := 0 to 1 do
+  begin
+    Resp := DoPost(Body);
+    J := GetJSON(Resp);
+    try
+      FReason := SafeStr(J, 'choices[0].finish_reason');
+      Ch := J.FindPath('choices[0].message.content');
+      if (Ch = nil) or (Ch is TJSONNull) then
+        Content := '' // null content -> retry
       else
-        raise Exception.Create('LLM returned empty content; increase LLM_MAX_TOKENS');
+        Content := Ch.AsString;
+    finally
+      J.Free;
     end;
-  finally
-    J.Free;
+    if Content <> '' then Break;
+    if Attempt = 0 then
+    begin
+      // gpt-oss and other reasoning models occasionally return content:null
+      // (token budget spent on reasoning or a transient hiccup) — retry once
+      WriteLn(StdErr, Format('WARN: LLM returned null/empty content (finish_reason=%s), retrying once', [FReason]));
+      Sleep(1000);
+    end;
   end;
+  if Content = '' then
+    raise Exception.Create('LLM returned null/empty content (finish_reason=' + FReason +
+      '); increase LLM_MAX_TOKENS; raw: ' + Copy(Resp, 1, 400));
   // history is updated only on success, so a failed call never poisons the context
   AppendMessage(ChatId, 'user', UserText);
-  AppendMessage(ChatId, 'assistant', Result);
+  AppendMessage(ChatId, 'assistant', Content);
+  Result := Content;
 end;
 
 initialization
