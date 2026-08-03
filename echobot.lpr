@@ -123,6 +123,7 @@ begin
     WriteLn(Format('Auth: enabled (%d authorized contacts, file %s)', [Auth.Count, Auth.Path]))
   else
     WriteLn('Auth: disabled (set BOT_AUTH_CODE) — bot is open');
+  Flush(Output); // ensure the banner reaches the journal even on restart
 
   Bot.OnInfo(@LogEvent);
   Bot.OnWarning(@LogEvent);
