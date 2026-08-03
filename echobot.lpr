@@ -124,7 +124,7 @@ begin
   SysInfo.Free;
 
   if LLM.IsConfigured then
-    WriteLn('LLM: ' + LLM.Model + ' @ ' + LLM.BaseURL)
+    WriteLn('LLM: ' + LLM.Model + ' @ ' + LLM.BaseURL + ' (history: ' + LLM.HistoryDir + ')')
   else
     WriteLn('LLM: not configured (set LLM_API_KEY) — bot replies only to /start');
 

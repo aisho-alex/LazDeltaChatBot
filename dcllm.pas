@@ -14,7 +14,11 @@ unit dcllm;
     LLM_TIMEOUT    connect+IO timeout in seconds, default 120
     LLM_MAX_TOKENS default 1024
     LLM_TEMPERATURE default 0.2
-    LLM_HISTORY    max messages kept per chat in memory, default 20
+    LLM_HISTORY    max messages kept per chat, default 20
+    LLM_HISTORY_DIR directory for per-chat history files (chatId.json),
+                    default 'history' (relative to CWD). History is persisted
+                    after every successful exchange and reloaded on startup,
+                    so conversations survive bot restarts.
     LLM_RETRIES    extra attempts on 429 / network errors, default 2
 }
 
@@ -35,6 +39,7 @@ type
     MaxTokens: Integer;
     Temperature: Double;
     HistoryLen: Integer;
+    HistoryDir: string;
     Retries: Integer;
   end;
 
@@ -45,7 +50,10 @@ type
     function BuildRequestBody(ChatId: UInt64; const UserText: string): string;
     function DoPost(const Body: string): string;
     function RetryDelayMs(Client: TFPHTTPClient): Integer;
+    function HistoryPath(ChatId: UInt64): string;
     procedure EnsureChat(ChatId: UInt64);
+    procedure LoadHistory(ChatId: UInt64);
+    procedure SaveHistory(ChatId: UInt64);
     procedure AppendMessage(ChatId: UInt64; const Role, Content: string);
     procedure TrimHistory(ChatId: UInt64);
   public
@@ -54,6 +62,7 @@ type
     function IsConfigured: Boolean;
     property Model: string read FConfig.Model;
     property BaseURL: string read FConfig.BaseURL;
+    property HistoryDir: string read FConfig.HistoryDir;
     { Sends UserText (plus per-chat history) to the LLM and returns the
       assistant reply. Raises on failure. History is updated only on success. }
     function Complete(ChatId: UInt64; const UserText: string): string;
@@ -102,6 +111,8 @@ begin
   FConfig.MaxTokens    := GetEnvInt('LLM_MAX_TOKENS', 1024);
   FConfig.Temperature  := GetEnvFloat('LLM_TEMPERATURE', 0.2);
   FConfig.HistoryLen   := GetEnvInt('LLM_HISTORY', 20);
+  FConfig.HistoryDir   := GetEnvironmentVariable('LLM_HISTORY_DIR');
+  if FConfig.HistoryDir = '' then FConfig.HistoryDir := 'history';
   FConfig.Retries      := GetEnvInt('LLM_RETRIES', 2);
   FHistory := specialize TFPGMap<UInt64, TJSONArray>.Create;
 end;
@@ -124,7 +135,83 @@ end;
 procedure TDCLLM.EnsureChat(ChatId: UInt64);
 begin
   if FHistory.IndexOf(ChatId) < 0 then
+  begin
     FHistory.Add(ChatId, TJSONArray.Create);
+    LoadHistory(ChatId);
+  end;
+end;
+
+function TDCLLM.HistoryPath(ChatId: UInt64): string;
+begin
+  Result := IncludeTrailingPathDelimiter(FConfig.HistoryDir) + IntToStr(ChatId) + '.json';
+end;
+
+procedure TDCLLM.LoadHistory(ChatId: UInt64);
+var
+  P: string;
+  FS: TFileStream;
+  J: TJSONData;
+  Arr: TJSONArray;
+begin
+  P := HistoryPath(ChatId);
+  if not FileExists(P) then Exit;
+  try
+    FS := TFileStream.Create(P, fmOpenRead or fmShareDenyWrite);
+    try
+      J := GetJSON(FS);
+    finally
+      FS.Free;
+    end;
+    try
+      if J is TJSONArray then
+      begin
+        Arr := (J as TJSONArray).Clone as TJSONArray;
+        while Arr.Count > FConfig.HistoryLen do
+          Arr.Delete(0);
+        FHistory[ChatId].Free;
+        FHistory[ChatId] := Arr;
+        WriteLn(Format('DEBUG history loaded for chat %d: %d messages', [ChatId, Arr.Count]));
+      end
+      else
+        WriteLn(StdErr, Format('WARN: history file %s is not a JSON array, ignoring', [P]));
+    finally
+      J.Free; // frees the original, the clone lives in FHistory
+    end;
+  except
+    on E: Exception do
+      WriteLn(StdErr, Format('WARN: cannot load history for chat %d from %s: %s', [ChatId, P, E.Message]));
+  end;
+end;
+
+procedure TDCLLM.SaveHistory(ChatId: UInt64);
+var
+  Dir, P, PTmp, S: string;
+  FS: TFileStream;
+begin
+  try
+    Dir := FConfig.HistoryDir;
+    if not DirectoryExists(Dir) then
+      if not ForceDirectories(Dir) then
+      begin
+        WriteLn(StdErr, Format('WARN: cannot create history dir %s', [Dir]));
+        Exit;
+      end;
+    P := HistoryPath(ChatId);
+    PTmp := P + '.tmp';
+    S := FHistory[ChatId].AsJSON;
+    FS := TFileStream.Create(PTmp, fmCreate);
+    try
+      FS.WriteBuffer(S[1], Length(S));
+    finally
+      FS.Free;
+    end;
+    // atomic-ish: rename over the previous file; on POSIX rename() overwrites
+    if not RenameFile(PTmp, P) then
+      WriteLn(StdErr, Format('WARN: cannot rename %s -> %s', [PTmp, P]));
+  except
+    on E: Exception do
+      WriteLn(StdErr, Format('WARN: cannot save history for chat %d: %s', [ChatId, E.Message]));
+  end;
 end;
 
 procedure TDCLLM.AppendMessage(ChatId: UInt64; const Role, Content: string);
@@ -137,6 +224,7 @@ begin
   M.Add('content', Content);
   FHistory[ChatId].Add(M);
   TrimHistory(ChatId);
+  SaveHistory(ChatId);
 end;
 
 procedure TDCLLM.TrimHistory(ChatId: UInt64);
@@ -163,6 +251,9 @@ begin
     begin
       Messages.Add(TJSONObject.Create(['role', 'system', 'content', FConfig.SystemPrompt]));
     end;
+    // make sure the chat entry exists and on-disk history is loaded BEFORE
+    // assembling the request (in a fresh process the map is empty)
+    EnsureChat(ChatId);
     if FHistory.IndexOf(ChatId) >= 0 then
     begin
       Hist := FHistory[ChatId];

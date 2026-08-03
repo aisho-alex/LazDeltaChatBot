@@ -24,7 +24,8 @@ environment variables; no code changes needed.
 | `LLM_TIMEOUT`    | Connect + I/O timeout, seconds                          | `120`                            |
 | `LLM_MAX_TOKENS` | Max output tokens (reasoning models need headroom)      | `1024`                           |
 | `LLM_TEMPERATURE`| Sampling temperature                                    | `0.2`                            |
-| `LLM_HISTORY`    | Messages kept per chat in memory (multi-turn context)   | `20`                             |
+| `LLM_HISTORY`    | Messages kept per chat (multi-turn context)             | `20`                             |
+| `LLM_HISTORY_DIR`| Directory for per-chat history files (`<chatId>.json`)  | `history`                        |
 | `LLM_RETRIES`    | Extra attempts on 429 / 5xx / network errors            | `2`                              |
 
 Example (neuraldeep Hub, model with long context):
@@ -36,9 +37,13 @@ LLM_API_KEY=sk-... LLM_MODEL=qwen3.6-35b-a3b ./echobot
 Behavior notes:
 
 - `/start` always replies `работаю` without calling the LLM (health check).
-- The last `LLM_HISTORY` messages per chat are kept in memory and sent
-  along, so multi-turn conversations have context. History is updated only
-  on success, so a failed call never poisons the next request.
+- The last `LLM_HISTORY` messages per chat are sent along, so multi-turn
+  conversations have context. History is updated only on success, so a
+  failed call never poisons the next request.
+- History is persisted to `LLM_HISTORY_DIR/<chatId>.json` after every
+  successful exchange (atomic write via `.tmp` + rename) and reloaded on
+  startup, so conversations survive bot restarts (e.g. watchdog-triggered).
+  A missing/corrupt file is logged and ignored — the chat starts fresh.
 - Each chat pins an upstream worker via the `user: dcbot:<chatId>` field
   (session-sticky routing keeps the KV cache warm on the Hub).
 - Rate limits (429) and transient errors are retried with a short backoff
