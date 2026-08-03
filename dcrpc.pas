@@ -22,6 +22,15 @@ type
     constructor Create(ARpc: TRpc);
   end;
 
+  TRpcErrReaderThread = class(TThread)
+  private
+    FRpc: TRpc;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(ARpc: TRpc);
+  end;
+
   TRpc = class
   private
     FTransport: TDCTransport;
@@ -30,7 +39,9 @@ type
     FResponses: TResponseMap;
     FEvents: TEventMap;
     FReaderThread: TRpcReaderThread;
+    FErrReaderThread: TRpcErrReaderThread;
     procedure ReaderExecute;
+    procedure ErrReaderExecute;
     function NextID: UInt64;
     procedure SendRequest(const AMethodName: string; Params: TJSONArray; ReqID: UInt64);
     function WaitForResponse(ReqID: UInt64): TJSONData;
@@ -58,6 +69,21 @@ begin
   FRpc.ReaderExecute;
 end;
 
+{ TRpcErrReaderThread }
+
+constructor TRpcErrReaderThread.Create(ARpc: TRpc);
+begin
+  inherited Create(True); // create suspended
+  FRpc := ARpc;
+  FreeOnTerminate := False;
+  Start;
+end;
+
+procedure TRpcErrReaderThread.Execute;
+begin
+  FRpc.ErrReaderExecute;
+end;
+
 { TRpc }
 
 constructor TRpc.Create(ATransport: TDCTransport);
@@ -69,10 +95,14 @@ begin
   FResponses := TResponseMap.Create;
   FEvents := TEventMap.Create;
   FReaderThread := TRpcReaderThread.Create(Self);
+  FErrReaderThread := TRpcErrReaderThread.Create(Self);
 end;
 
 destructor TRpc.Destroy;
 begin
+  FErrReaderThread.Terminate;
+  FErrReaderThread.WaitFor;
+  FErrReaderThread.Free;
   FReaderThread.Terminate;
   FReaderThread.WaitFor;
   FReaderThread.Free;
@@ -182,6 +212,26 @@ begin
     // Extract ownership: clone result, free full response
     Result := Result.Clone;
     FullResp.Free;
+  end;
+end;
+
+procedure TRpc.ErrReaderExecute;
+var
+  Line: RawByteString;
+begin
+  // Drain deltachat-rpc-server's stderr: with poUsePipes FPC pipes stderr too,
+  // and if nobody reads it, the 64KB pipe fills up and the core blocks on log
+  // writes, freezing the whole bot. Forward lines to our stderr so they stay
+  // visible in the journal.
+  while not FErrReaderThread.Terminated do
+  begin
+    Line := FTransport.ReadErrLine;
+    if Line = '' then
+    begin
+      Sleep(10); // child gone or idle — avoid busy-spin
+      Continue;
+    end;
+    WriteLn(StdErr, string(Line));
   end;
 end;
 

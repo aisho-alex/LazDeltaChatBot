@@ -17,6 +17,7 @@ type
     procedure Open;
     procedure Close;
     function ReadLine: RawByteString;
+    function ReadErrLine: RawByteString;
     procedure WriteLine(const S: RawByteString);
     property Process: TProcess read FProcess;
   end;
@@ -125,6 +126,22 @@ begin
   while True do
   begin
     N := FProcess.Output.Read(B, 1);
+    if N = 0 then Break;
+    if B = 10 then Break;
+    Result := Result + Chr(B);
+  end;
+end;
+
+function TDCTransport.ReadErrLine: RawByteString;
+var
+  B: Byte;
+  N: Integer;
+begin
+  Result := '';
+  if not FProcess.Running then Exit;
+  while True do
+  begin
+    N := FProcess.Stderr.Read(B, 1);
     if N = 0 then Break;
     if B = 10 then Break;
     Result := Result + Chr(B);
