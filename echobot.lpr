@@ -13,6 +13,7 @@ uses
   dcjson,
   dcllm,
   dcauth,
+  dcwatchdog,
   fpjson;
 
 var
@@ -21,9 +22,12 @@ var
   Bot: TDCBot;
   LLM: TDCLLM;
   Auth: TAuthStore;
+  Watchdog: TDCWatchdog;
   AccId: TAccountId;
   SysInfo: TJSONObject;
   AddrOpt: TOptionString;
+  WdIntervalSec: Integer;
+  WdTimeoutSec: Integer;
 
 procedure LogEvent(AccId: TAccountId; const Ev: TDCEvent);
 begin
@@ -123,6 +127,20 @@ begin
     WriteLn(Format('Auth: enabled (%d authorized contacts, file %s)', [Auth.Count, Auth.Path]))
   else
     WriteLn('Auth: disabled (set BOT_AUTH_CODE) — bot is open');
+
+  // Watchdog: pings the core; on timeout it Halt(1)s so systemd restarts us.
+  if GetEnvironmentVariable('BOT_WATCHDOG') <> '0' then
+  begin
+    WdIntervalSec := StrToIntDef(GetEnvironmentVariable('BOT_WATCHDOG_INTERVAL'), 60);
+    WdTimeoutSec := StrToIntDef(GetEnvironmentVariable('BOT_WATCHDOG_TIMEOUT'), 30);
+    Watchdog := TDCWatchdog.Create(Client.Rpc, WdIntervalSec, WdTimeoutSec);
+    WriteLn(Format('Watchdog: enabled (every %d s, timeout %d s)', [WdIntervalSec, WdTimeoutSec]));
+  end
+  else
+  begin
+    Watchdog := nil;
+    WriteLn('Watchdog: disabled (BOT_WATCHDOG=0)');
+  end;
   Flush(Output); // ensure the banner reaches the journal even on restart
 
   Bot.OnInfo(@LogEvent);
@@ -147,6 +165,12 @@ begin
   Bot.Run;
 
   Bot.Free;
+  if Assigned(Watchdog) then
+  begin
+    Watchdog.Terminate;
+    Watchdog.WaitFor;
+    Watchdog.Free;
+  end;
   Auth.Free;
   LLM.Free;
   Client.Free;

@@ -44,12 +44,13 @@ type
     procedure ErrReaderExecute;
     function NextID: UInt64;
     procedure SendRequest(const AMethodName: string; Params: TJSONArray; ReqID: UInt64);
-    function WaitForResponse(ReqID: UInt64): TJSONData;
+    function WaitForResponse(ReqID: UInt64; TimeoutMs: Integer = 0): TJSONData;
   public
     constructor Create(ATransport: TDCTransport);
     destructor Destroy; override;
     procedure Call(const AMethodName: string; Params: TJSONArray);
     function CallResult(const AMethodName: string; Params: TJSONArray): TJSONData;
+    function CallResultTimeout(const AMethodName: string; Params: TJSONArray; TimeoutMs: Integer): TJSONData;
   end;
 
 implementation
@@ -154,19 +155,26 @@ begin
 end;
 
 function TRpc.CallResult(const AMethodName: string; Params: TJSONArray): TJSONData;
+begin
+  Result := CallResultTimeout(AMethodName, Params, 0); // 0 = wait forever
+end;
+
+function TRpc.CallResultTimeout(const AMethodName: string; Params: TJSONArray; TimeoutMs: Integer): TJSONData;
 var
   ID: UInt64;
 begin
   ID := NextID;
   SendRequest(AMethodName, Params, ID); // Params is freed by SendRequest
-  Result := WaitForResponse(ID);
+  Result := WaitForResponse(ID, TimeoutMs);
 end;
 
-function TRpc.WaitForResponse(ReqID: UInt64): TJSONData;
+function TRpc.WaitForResponse(ReqID: UInt64; TimeoutMs: Integer): TJSONData;
 var
   RespEvent: TEvent;
   FullResp: TJSONData;
   ErrData: TJSONData;
+  W: TWaitResult;
+  TimedOut: Boolean;
 begin
   RespEvent := TEvent.Create(nil, True, False, '');
   FLock.Enter;
@@ -175,11 +183,24 @@ begin
   finally
     FLock.Leave;
   end;
-  RespEvent.WaitFor(INFINITE);
+  if TimeoutMs > 0 then
+    W := RespEvent.WaitFor(TimeoutMs)
+  else
+  begin
+    RespEvent.WaitFor(INFINITE);
+    W := wrSignaled;
+  end;
+  TimedOut := (W <> wrSignaled);
   FLock.Enter;
   try
     if not FResponses.TryGetData(ReqID, FullResp) then
-      raise Exception.CreateFmt('No response for request %d', [ReqID]);
+    begin
+      FEvents.Remove(ReqID);
+      if TimedOut then
+        raise Exception.CreateFmt('RPC timeout waiting for response %d (%d ms)', [ReqID, TimeoutMs])
+      else
+        raise Exception.CreateFmt('No response for request %d', [ReqID]);
+    end;
     FResponses.Remove(ReqID);
     FEvents.Remove(ReqID);
   finally
