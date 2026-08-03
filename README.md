@@ -5,7 +5,45 @@ A Free Pascal port of the Delta Chat echo bot that talks to
 via JSON-RPC over stdio.
 
 On the wire the bot replies to `/start` with the literal string
-`работаю`; other incoming messages are ignored.
+`работаю`; every other text message from a real contact is forwarded to an
+LLM (see "LLM replies" below) and the model's answer is sent back.
+
+## LLM replies
+
+The bot speaks the OpenAI-compatible `/v1/chat/completions` protocol, so it
+works against any provider that exposes it — neuraldeep Hub, Drift, a local
+Hermes gateway `api_server`, etc. The backend is selected purely via
+environment variables; no code changes needed.
+
+| Variable         | Description                                             | Default                          |
+|------------------|---------------------------------------------------------|----------------------------------|
+| `LLM_BASE_URL`   | API base URL                                            | `https://api.neuraldeep.ru/v1`   |
+| `LLM_API_KEY`    | Bearer token (`sk-*` for Hub, `dft_*` for Drift, …)     | *(empty = LLM disabled)*         |
+| `LLM_MODEL`      | Model name                                              | `gpt-oss-120b`                   |
+| `LLM_SYSTEM`     | System prompt                                           | short Russian assistant prompt   |
+| `LLM_TIMEOUT`    | Connect + I/O timeout, seconds                          | `120`                            |
+| `LLM_MAX_TOKENS` | Max output tokens (reasoning models need headroom)      | `1024`                           |
+| `LLM_TEMPERATURE`| Sampling temperature                                    | `0.2`                            |
+| `LLM_HISTORY`    | Messages kept per chat in memory (multi-turn context)   | `20`                             |
+| `LLM_RETRIES`    | Extra attempts on 429 / 5xx / network errors            | `2`                              |
+
+Example (neuraldeep Hub, model with long context):
+
+```sh
+LLM_API_KEY=sk-... LLM_MODEL=qwen3.6-35b-a3b ./echobot
+```
+
+Behavior notes:
+
+- `/start` always replies `работаю` without calling the LLM (health check).
+- The last `LLM_HISTORY` messages per chat are kept in memory and sent
+  along, so multi-turn conversations have context. History is updated only
+  on success, so a failed call never poisons the next request.
+- Each chat pins an upstream worker via the `user: dcbot:<chatId>` field
+  (session-sticky routing keeps the KV cache warm on the Hub).
+- Rate limits (429) and transient errors are retried with a short backoff
+  honoring `Retry-After`; client errors (401/400) are logged and skipped.
+- With no `LLM_API_KEY` the bot falls back to the plain echo behavior.
 
 ## Build & run
 

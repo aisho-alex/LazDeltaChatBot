@@ -17,15 +17,20 @@ FPC      ?= $(if $(FPC_ROOT),$(FPC_ROOT),fpc)
 FPC_BIN := $(if $(wildcard $(FPC)/bin/.*),$(firstword $(wildcard $(FPC)/bin/*/fpc)),$(FPC))
 
 # FPC_UNITS: when using an fpcupdeluxe tree, point at its units dirs so
-# fcl-process etc. resolve. When using system fpc, rely on its own
-# search paths.
+# fcl-process, fphttpclient/openssl etc. resolve. When using system fpc,
+# rely on its own search paths.
+ARCH := $(shell uname -m | sed 's/x86_64/x86_64-linux/;s/aarch64/aarch64-linux/')
 FPC_UNITS ?= $(if $(FPC_ROOT),\
-  $(FPC_ROOT)/units/$(shell uname -m | sed 's/x86_64/x86_64-linux/;s/aarch64/aarch64-linux/')/rtl \
-  $(FPC_ROOT)/units/$(shell uname -m | sed 's/x86_64/x86_64-linux/;s/aarch64/aarch64-linux/')/rtl-objpas \
-  $(FPC_ROOT)/units/$(shell uname -m | sed 's/x86_64/x86_64-linux/;s/aarch64/aarch64-linux/')/fcl-json \
-  $(FPC_ROOT)/units/$(shell uname -m | sed 's/x86_64/x86_64-linux/;s/aarch64/aarch64-linux/')/fcl-base \
-  $(FPC_ROOT)/units/$(shell uname -m | sed 's/x86_64/x86_64-linux/;s/aarch64/aarch64-linux/')/fcl-process \
-  $(FPC_ROOT)/units/$(shell uname -m | sed 's/x86_64/x86_64-linux/;s/aarch64/aarch64-linux/')/pthreads \
+  $(FPC_ROOT)/units/$(ARCH)/rtl \
+  $(FPC_ROOT)/units/$(ARCH)/rtl-objpas \
+  $(FPC_ROOT)/units/$(ARCH)/rtl-extra \
+  $(FPC_ROOT)/units/$(ARCH)/fcl-json \
+  $(FPC_ROOT)/units/$(ARCH)/fcl-base \
+  $(FPC_ROOT)/units/$(ARCH)/fcl-process \
+  $(FPC_ROOT)/units/$(ARCH)/fcl-web \
+  $(FPC_ROOT)/units/$(ARCH)/fcl-net \
+  $(FPC_ROOT)/units/$(ARCH)/openssl \
+  $(FPC_ROOT)/units/$(ARCH)/pthreads \
 ,)
 
 help:

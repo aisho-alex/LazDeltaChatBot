@@ -11,12 +11,14 @@ uses
   dctypes,
   dcevents,
   dcjson,
+  dcllm,
   fpjson;
 
 var
   Transport: TDCTransport;
   Client: TDCClient;
   Bot: TDCBot;
+  LLM: TDCLLM;
   AccId: TAccountId;
   SysInfo: TJSONObject;
   AddrOpt: TOptionString;
@@ -33,21 +35,42 @@ end;
 procedure HandleNewMsg(AccId: TAccountId; MsgId: TMsgId);
 var
   Snap: TMsgSnapshot;
-  Text: string;
+  Text, Reply: string;
 begin
   Snap := Client.GetMessage(AccId, MsgId);
   WriteLn(Format('DEBUG msg id=%d chat=%d from=%d isBot=%s isInfo=%s text="%s"',
     [Snap.Id, Snap.ChatId, Snap.FromId,
      BoolToStr(Snap.IsBot, True), BoolToStr(Snap.IsInfo, True),
      Snap.Text]));
-  if Snap.FromId > ContactLastSpecial then
+  if Snap.FromId <= ContactLastSpecial then Exit;
+  Text := Trim(Snap.Text);
+  if Text = '' then Exit;
+  if Text = '/start' then
   begin
-    Text := Trim(Snap.Text);
-    if Text = '/start' then
+    WriteLn('DEBUG replying with "работаю" to /start');
+    Client.MiscSendTextMessage(AccId, Snap.ChatId, 'работаю');
+    Exit;
+  end;
+  if not LLM.IsConfigured then
+  begin
+    WriteLn('WARN: LLM not configured (set LLM_API_KEY), ignoring message');
+    Exit;
+  end;
+  WriteLn(Format('DEBUG LLM -> chat=%d (%d chars)', [Snap.ChatId, Length(Text)]));
+  Flush(Output);
+  try
+    Reply := LLM.Complete(Snap.ChatId, Text);
+  except
+    on E: Exception do
     begin
-      WriteLn('DEBUG replying with "работаю" to /start');
-      Client.MiscSendTextMessage(AccId, Snap.ChatId, 'работаю');
+      WriteLn(StdErr, 'ERROR: LLM call failed: ' + E.Message);
+      Reply := '';
     end;
+  end;
+  if Reply <> '' then
+  begin
+    WriteLn(Format('DEBUG LLM <- chat=%d (%d chars)', [Snap.ChatId, Length(Reply)]));
+    Client.MiscSendTextMessage(AccId, Snap.ChatId, Reply);
   end;
 end;
 
@@ -56,12 +79,18 @@ begin
   Transport.Open;
   Client := TDCClient.Create(Transport);
   Bot := TDCBot.Create(Client);
+  LLM := TDCLLM.Create;
 
   AccId := GetAccount(Client);
 
   SysInfo := Client.GetSystemInfo;
   WriteLn('Running deltachat core ' + SysInfo.Find('deltachat_core_version').AsString);
   SysInfo.Free;
+
+  if LLM.IsConfigured then
+    WriteLn('LLM: ' + LLM.Model + ' @ ' + LLM.BaseURL)
+  else
+    WriteLn('LLM: not configured (set LLM_API_KEY) — bot replies only to /start');
 
   Bot.OnInfo(@LogEvent);
   Bot.OnWarning(@LogEvent);
@@ -85,6 +114,7 @@ begin
   Bot.Run;
 
   Bot.Free;
+  LLM.Free;
   Client.Free;
   Transport.Close;
   Transport.Free;
