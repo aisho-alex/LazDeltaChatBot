@@ -88,14 +88,19 @@ begin
   end;
   WriteLn(Format('DEBUG LLM -> chat=%d (%d chars)', [Snap.ChatId, Length(Text)]));
   Flush(Output);
+  WatchdogBusy := True;
   try
-    Reply := LLM.Complete(Snap.ChatId, Text);
-  except
-    on E: Exception do
-    begin
-      WriteLn(StdErr, 'ERROR: LLM call failed: ' + E.Message);
-      Reply := '';
+    try
+      Reply := LLM.Complete(Snap.ChatId, Text);
+    except
+      on E: Exception do
+      begin
+        WriteLn(StdErr, 'ERROR: LLM call failed: ' + E.Message);
+        Reply := '';
+      end;
     end;
+  finally
+    WatchdogBusy := False;
   end;
   if Reply <> '' then
   begin
@@ -131,9 +136,9 @@ begin
   // Watchdog: pings the core; on timeout it Halt(1)s so systemd restarts us.
   if GetEnvironmentVariable('BOT_WATCHDOG') <> '0' then
   begin
-    WdIntervalSec := StrToIntDef(GetEnvironmentVariable('BOT_WATCHDOG_INTERVAL'), 60);
-    WdTimeoutSec := StrToIntDef(GetEnvironmentVariable('BOT_WATCHDOG_TIMEOUT'), 30);
-    Watchdog := TDCWatchdog.Create(Client.Rpc, WdIntervalSec, WdTimeoutSec);
+    WdIntervalSec := StrToIntDef(GetEnvironmentVariable('BOT_WATCHDOG_INTERVAL'), 30);
+    WdTimeoutSec := StrToIntDef(GetEnvironmentVariable('BOT_WATCHDOG_TIMEOUT'), 15);
+    Watchdog := TDCWatchdog.Create(Client.Rpc, AccId, WdIntervalSec, WdTimeoutSec);
     WriteLn(Format('Watchdog: enabled (every %d s, timeout %d s)', [WdIntervalSec, WdTimeoutSec]));
   end
   else
