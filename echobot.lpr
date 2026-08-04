@@ -42,6 +42,8 @@ procedure HandleNewMsg(AccId: TAccountId; MsgId: TMsgId);
 var
   Snap: TMsgSnapshot;
   Text, Reply, Code: string;
+  M, Q, Kind, W: string;
+  P: Integer;
 begin
   Snap := Client.GetMessage(AccId, MsgId);
   WriteLn(Format('DEBUG msg id=%d chat=%d from=%d isBot=%s isInfo=%s text="%s"',
@@ -86,6 +88,96 @@ begin
     WriteLn('WARN: LLM not configured (set LLM_API_KEY), ignoring message');
     Exit;
   end;
+
+  // --- bot commands ---
+  if Text = '/help' then
+  begin
+    Client.MiscSendTextMessage(AccId, Snap.ChatId,
+      'Команды:' + LineEnding +
+      '/model — текущая модель и список доступных' + LineEnding +
+      '/model <имя> — сменить модель для этого чата' + LineEnding +
+      '/search <запрос> — поиск в интернете' + LineEnding +
+      '/search tg <запрос> — поиск по Telegram-каналам' + LineEnding +
+      '/search crawl <url> — обойти сайт' + LineEnding +
+      '/clear — очистить контекст чата' + LineEnding +
+      '  (для Drift — создать новую сессию)');
+    Exit;
+  end;
+
+  if (Text = '/model') or (Copy(Text, 1, 7) = '/model ') then
+  begin
+    M := Trim(Copy(Text, 8, Length(Text) - 7));
+    if M = '' then
+    begin
+      try
+        Reply := 'Модель чата: ' + LLM.ChatModel(Snap.ChatId) + LineEnding +
+                 'Доступные: ' + LLM.AvailableModels;
+      except
+        on E: Exception do
+          Reply := 'Ошибка: ' + E.Message;
+      end;
+    end
+    else
+    begin
+      try
+        LLM.SetModel(Snap.ChatId, M);
+        Reply := '✅ Модель чата: ' + M;
+      except
+        on E: Exception do
+          Reply := '❌ ' + E.Message;
+      end;
+    end;
+    Client.MiscSendTextMessage(AccId, Snap.ChatId, Reply);
+    Exit;
+  end;
+
+  if Text = '/clear' then
+  begin
+    try
+      LLM.ClearContext(Snap.ChatId);
+      if LLM.IsDrift then
+        Reply := '🧹 Создана новая сессия Drift.'
+      else
+        Reply := '🧹 Контекст чата очищен.';
+    except
+      on E: Exception do
+        Reply := '❌ ' + E.Message;
+    end;
+    Client.MiscSendTextMessage(AccId, Snap.ChatId, Reply);
+    Exit;
+  end;
+
+  if Copy(Text, 1, 8) = '/search ' then
+  begin
+    Q := Trim(Copy(Text, 9, Length(Text) - 8));
+    Kind := 'web';
+    P := Pos(' ', Q);
+    if P > 0 then
+    begin
+      W := LowerCase(Copy(Q, 1, P - 1));
+      if (W = 'web') or (W = 'tg') or (W = 'crawl') then
+      begin
+        Kind := W;
+        Q := Trim(Copy(Q, P + 1, Length(Q) - P));
+      end;
+    end;
+    if Q = '' then
+      Reply := 'Использование: /search <запрос> | /search tg <запрос> | /search crawl <url>'
+    else
+    begin
+      WriteLn(Format('DEBUG search kind=%s q="%s" chat=%d', [Kind, Q, Snap.ChatId]));
+      Flush(Output);
+      try
+        Reply := '🔎 ' + Kind + ': ' + Q + LineEnding + LLM.Search(Kind, Q);
+      except
+        on E: Exception do
+          Reply := '❌ Ошибка поиска: ' + E.Message;
+      end;
+    end;
+    Client.MiscSendTextMessage(AccId, Snap.ChatId, Reply);
+    Exit;
+  end;
+
   WriteLn(Format('DEBUG LLM -> chat=%d (%d chars)', [Snap.ChatId, Length(Text)]));
   Flush(Output);
   WatchdogBusy := True;

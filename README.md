@@ -37,6 +37,22 @@ LLM_API_KEY=sk-... LLM_MODEL=qwen3.6-35b-a3b ./echobot
 Behavior notes:
 
 - `/start` always replies `работаю` without calling the LLM (health check).
+- Chat commands (all except `/start` require an authorized contact):
+  - `/model` — show the current per-chat model and the list from `GET /v1/models`
+  - `/model <name>` — switch the model for this chat (persisted in
+    `LLM_HISTORY_DIR/<chatId>.meta`, survives restarts)
+  - `/search <query>` — web search; `/search tg <query>` — Telegram-channel
+    search; `/search crawl <url>` — crawl a site (neuraldeep Search API,
+    same key, separate quota; 5 results)
+  - `/clear` — reset the chat context: for Hub backends wipes the in-memory
+    history and deletes `<chatId>.json`; for Drift forgets the
+    `conversation_id` so the next request starts a NEW session on the
+    provider side
+  - `/help` — list of commands
+- When `LLM_BASE_URL` contains `drift`, the bot talks to Drift: it sends
+  only the latest user prompt plus `conversation_id` (Drift keeps its own
+  per-conversation memory in its DB, so sending history would duplicate it).
+  A new conversation is created automatically on first use.
 - The last `LLM_HISTORY` messages per chat are sent along, so multi-turn
   conversations have context. History is updated only on success, so a
   failed call never poisons the next request.

@@ -47,15 +47,25 @@ type
   private
     FConfig: TLLMConfig;
     FHistory: specialize TFPGMap<UInt64, TJSONArray>; // chatId -> message objects
+    FModelCache: specialize TFPGMap<UInt64, string>;  // chatId -> per-chat model
+    FSessionCache: specialize TFPGMap<UInt64, string>; // chatId -> Drift conversation_id
+    FIsDrift: Boolean; // backend is Drift (base URL contains 'drift')
     function BuildRequestBody(ChatId: UInt64; const UserText: string): string;
     function DoPost(const Body: string): string;
+    function DoRequest(const Method, Url, Body: string; out Status: Integer): string;
     function RetryDelayMs(Client: TFPHTTPClient): Integer;
     function HistoryPath(ChatId: UInt64): string;
+    function MetaPath(ChatId: UInt64): string;
     procedure EnsureChat(ChatId: UInt64);
     procedure LoadHistory(ChatId: UInt64);
     procedure SaveHistory(ChatId: UInt64);
+    procedure LoadMeta(ChatId: UInt64);
+    procedure SaveMeta(ChatId: UInt64);
     procedure AppendMessage(ChatId: UInt64; const Role, Content: string);
     procedure TrimHistory(ChatId: UInt64);
+    function ResolveModel(ChatId: UInt64): string;
+    function ResolveSession(ChatId: UInt64): string;
+    function ModelAvailable(const ModelName: string): Boolean;
   public
     constructor Create;
     destructor Destroy; override;
@@ -63,9 +73,24 @@ type
     property Model: string read FConfig.Model;
     property BaseURL: string read FConfig.BaseURL;
     property HistoryDir: string read FConfig.HistoryDir;
+    property IsDrift: Boolean read FIsDrift;
     { Sends UserText (plus per-chat history) to the LLM and returns the
       assistant reply. Raises on failure. History is updated only on success. }
     function Complete(ChatId: UInt64; const UserText: string): string;
+    { Current per-chat model (defaults to LLM_MODEL). }
+    function ChatModel(ChatId: UInt64): string;
+    { Comma-separated model ids from GET /v1/models. Raises on failure. }
+    function AvailableModels: string;
+    { Sets the per-chat model, validating against /v1/models when the
+      provider exposes it. Raises if the model is not in the list. }
+    procedure SetModel(ChatId: UInt64; const ModelName: string);
+    { Search API (neuraldeep Hub): Kind = 'web' | 'tg' | 'crawl'.
+      Returns a human-readable summary of the top results. }
+    function Search(const Kind, Query: string): string;
+    { Clears the chat context. For Hub backends: wipes the in-memory
+      history and deletes the history file. For Drift: creates a NEW
+      conversation (new session), since Drift keeps its own memory. }
+    procedure ClearContext(ChatId: UInt64);
   end;
 
 implementation
@@ -97,6 +122,17 @@ begin
     Result := StrToFloatDef(S, Default);
 end;
 
+function SafeStr(J: TJSONData; const Path: string): string;
+var
+  D: TJSONData;
+begin
+  D := J.FindPath(Path);
+  if (D <> nil) and not (D is TJSONNull) then
+    Result := D.AsString
+  else
+    Result := 'null';
+end;
+
 constructor TDCLLM.Create;
 begin
   inherited Create;
@@ -114,7 +150,10 @@ begin
   FConfig.HistoryDir   := GetEnvironmentVariable('LLM_HISTORY_DIR');
   if FConfig.HistoryDir = '' then FConfig.HistoryDir := 'history';
   FConfig.Retries      := GetEnvInt('LLM_RETRIES', 2);
+  FIsDrift := Pos('drift', LowerCase(FConfig.BaseURL)) > 0;
   FHistory := specialize TFPGMap<UInt64, TJSONArray>.Create;
+  FModelCache := specialize TFPGMap<UInt64, string>.Create;
+  FSessionCache := specialize TFPGMap<UInt64, string>.Create;
 end;
 
 destructor TDCLLM.Destroy;
@@ -124,6 +163,8 @@ begin
   for i := 0 to FHistory.Count - 1 do
     FHistory.Data[i].Free;
   FHistory.Free;
+  FModelCache.Free;
+  FSessionCache.Free;
   inherited Destroy;
 end;
 
@@ -138,7 +179,13 @@ begin
   begin
     FHistory.Add(ChatId, TJSONArray.Create);
     LoadHistory(ChatId);
+    LoadMeta(ChatId);
   end;
+end;
+
+function TDCLLM.MetaPath(ChatId: UInt64): string;
+begin
+  Result := IncludeTrailingPathDelimiter(FConfig.HistoryDir) + IntToStr(ChatId) + '.meta';
 end;
 
 function TDCLLM.HistoryPath(ChatId: UInt64): string;
@@ -214,6 +261,77 @@ begin
   end;
 end;
 
+procedure TDCLLM.LoadMeta(ChatId: UInt64);
+var
+  P: string;
+  FS: TFileStream;
+  J: TJSONData;
+  S: string;
+begin
+  P := MetaPath(ChatId);
+  if not FileExists(P) then Exit;
+  try
+    FS := TFileStream.Create(P, fmOpenRead or fmShareDenyWrite);
+    try
+      J := GetJSON(FS);
+    finally
+      FS.Free;
+    end;
+    try
+      S := SafeStr(J, 'model');
+      if (S <> '') and (S <> 'null') then FModelCache[ChatId] := S;
+      S := SafeStr(J, 'session');
+      if (S <> '') and (S <> 'null') then FSessionCache[ChatId] := S;
+    finally
+      J.Free;
+    end;
+  except
+    on E: Exception do
+      WriteLn(StdErr, Format('WARN: cannot load meta for chat %d from %s: %s', [ChatId, P, E.Message]));
+  end;
+end;
+
+procedure TDCLLM.SaveMeta(ChatId: UInt64);
+var
+  Dir, P, PTmp, S: string;
+  Obj: TJSONObject;
+  FS: TFileStream;
+begin
+  Obj := TJSONObject.Create;
+  try
+    if FModelCache.IndexOf(ChatId) >= 0 then
+      Obj.Add('model', FModelCache[ChatId]);
+    if FSessionCache.IndexOf(ChatId) >= 0 then
+      Obj.Add('session', FSessionCache[ChatId]);
+    S := Obj.AsJSON;
+  finally
+    Obj.Free;
+  end;
+  if S = '{}' then Exit; // nothing to persist
+  try
+    Dir := FConfig.HistoryDir;
+    if not DirectoryExists(Dir) then
+      if not ForceDirectories(Dir) then
+      begin
+        WriteLn(StdErr, Format('WARN: cannot create history dir %s', [Dir]));
+        Exit;
+      end;
+    P := MetaPath(ChatId);
+    PTmp := P + '.tmp';
+    FS := TFileStream.Create(PTmp, fmCreate);
+    try
+      FS.WriteBuffer(S[1], Length(S));
+    finally
+      FS.Free;
+    end;
+    if not RenameFile(PTmp, P) then
+      WriteLn(StdErr, Format('WARN: cannot rename %s -> %s', [PTmp, P]));
+  except
+    on E: Exception do
+      WriteLn(StdErr, Format('WARN: cannot save meta for chat %d: %s', [ChatId, E.Message]));
+  end;
+end;
+
 procedure TDCLLM.AppendMessage(ChatId: UInt64; const Role, Content: string);
 var
   M: TJSONObject;
@@ -245,27 +363,38 @@ var
 begin
   Obj := TJSONObject.Create;
   try
-    Obj.Add('model', FConfig.Model);
+    Obj.Add('model', ResolveModel(ChatId));
     Messages := TJSONArray.Create;
-    if FConfig.SystemPrompt <> '' then
+    if FIsDrift then
     begin
-      Messages.Add(TJSONObject.Create(['role', 'system', 'content', FConfig.SystemPrompt]));
-    end;
-    // make sure the chat entry exists and on-disk history is loaded BEFORE
-    // assembling the request (in a fresh process the map is empty)
-    EnsureChat(ChatId);
-    if FHistory.IndexOf(ChatId) >= 0 then
+      // Drift pulls its own memory from its DB — send only the latest prompt,
+      // plus conversation_id to keep the session on the provider side.
+      Messages.Add(TJSONObject.Create(['role', 'user', 'content', UserText]));
+      Obj.Add('messages', Messages);
+      Obj.Add('conversation_id', StrToInt(ResolveSession(ChatId)));
+    end
+    else
     begin
-      Hist := FHistory[ChatId];
-      for i := 0 to Hist.Count - 1 do
-        Messages.Add(Hist.Items[i].Clone);
+      if FConfig.SystemPrompt <> '' then
+      begin
+        Messages.Add(TJSONObject.Create(['role', 'system', 'content', FConfig.SystemPrompt]));
+      end;
+      // make sure the chat entry exists and on-disk history is loaded BEFORE
+      // assembling the request (in a fresh process the map is empty)
+      EnsureChat(ChatId);
+      if FHistory.IndexOf(ChatId) >= 0 then
+      begin
+        Hist := FHistory[ChatId];
+        for i := 0 to Hist.Count - 1 do
+          Messages.Add(Hist.Items[i].Clone);
+      end;
+      Messages.Add(TJSONObject.Create(['role', 'user', 'content', UserText]));
+      Obj.Add('messages', Messages);
+      Obj.Add('max_tokens', FConfig.MaxTokens);
+      Obj.Add('temperature', FConfig.Temperature);
+      // session-sticky routing: keep the same upstream worker per chat (KV-cache)
+      Obj.Add('user', 'dcbot:' + IntToStr(ChatId));
     end;
-    Messages.Add(TJSONObject.Create(['role', 'user', 'content', UserText]));
-    Obj.Add('messages', Messages);
-    Obj.Add('max_tokens', FConfig.MaxTokens);
-    Obj.Add('temperature', FConfig.Temperature);
-    // session-sticky routing: keep the same upstream worker per chat (KV-cache)
-    Obj.Add('user', 'dcbot:' + IntToStr(ChatId));
     Result := Obj.AsJSON;
   finally
     Obj.Free; // frees Messages and all clones
@@ -350,15 +479,36 @@ begin
   end;
 end;
 
-function SafeStr(J: TJSONData; const Path: string): string;
+{ Generic HTTP request (GET or POST). Returns the body; Status is set to the
+  HTTP status code. fphttpclient does NOT raise on 4xx/5xx. }
+function TDCLLM.DoRequest(const Method, Url, Body: string; out Status: Integer): string;
 var
-  D: TJSONData;
+  C: TFPHTTPClient;
+  SS: TStringStream;
 begin
-  D := J.FindPath(Path);
-  if (D <> nil) and not (D is TJSONNull) then
-    Result := D.AsString
-  else
-    Result := 'null';
+  Result := '';
+  Status := 0;
+  C := TFPHTTPClient.Create(nil);
+  SS := nil;
+  try
+    C.ConnectTimeout := FConfig.TimeoutSec * 1000;
+    C.IOTimeout := FConfig.TimeoutSec * 1000;
+    C.AllowRedirect := True;
+    C.AddHeader('Authorization', 'Bearer ' + FConfig.ApiKey);
+    if Method = 'POST' then
+    begin
+      C.AddHeader('Content-Type', 'application/json');
+      SS := TStringStream.Create(Body);
+      C.RequestBody := SS;
+      Result := C.Post(Url);
+    end
+    else
+      Result := C.Get(Url);
+    Status := C.ResponseStatusCode;
+  finally
+    SS.Free;
+    C.Free;
+  end;
 end;
 
 function TDCLLM.Complete(ChatId: UInt64; const UserText: string): string;
@@ -405,6 +555,254 @@ begin
   AppendMessage(ChatId, 'user', UserText);
   AppendMessage(ChatId, 'assistant', Content);
   Result := Content;
+end;
+
+function TDCLLM.ResolveModel(ChatId: UInt64): string;
+begin
+  EnsureChat(ChatId); // loads meta into caches
+  if FModelCache.IndexOf(ChatId) >= 0 then
+    Result := FModelCache[ChatId]
+  else
+    Result := FConfig.Model;
+end;
+
+function TDCLLM.ChatModel(ChatId: UInt64): string;
+begin
+  Result := ResolveModel(ChatId);
+end;
+
+function TDCLLM.AvailableModels: string;
+var
+  Resp: string;
+  J: TJSONData;
+  Arr: TJSONArray;
+  i: Integer;
+  Ids: TStringList;
+  Status: Integer;
+begin
+  Result := '';
+  Resp := DoRequest('GET', FConfig.BaseURL + '/models', '', Status);
+  if (Status < 200) or (Status >= 300) then
+    raise Exception.CreateFmt('GET /models HTTP %d: %s', [Status, Copy(Resp, 1, 200)]);
+  J := GetJSON(Resp);
+  try
+    Arr := J.FindPath('data') as TJSONArray;
+    if Arr = nil then
+      raise Exception.Create('GET /models: no "data" array in response');
+    Ids := TStringList.Create;
+    try
+      for i := 0 to Arr.Count - 1 do
+        Ids.Add(Arr.Items[i].FindPath('id').AsString);
+      Ids.Sort;
+      Result := Ids.CommaText;
+    finally
+      Ids.Free;
+    end;
+  finally
+    J.Free;
+  end;
+end;
+
+function TDCLLM.ModelAvailable(const ModelName: string): Boolean;
+var
+  Resp: string;
+  J: TJSONData;
+  Arr: TJSONArray;
+  i: Integer;
+  Status: Integer;
+begin
+  Result := True; // accept if we cannot verify (provider may not expose /models)
+  try
+    Resp := DoRequest('GET', FConfig.BaseURL + '/models', '', Status);
+    if (Status >= 200) and (Status < 300) then
+    begin
+      J := GetJSON(Resp);
+      try
+        Arr := J.FindPath('data') as TJSONArray;
+        if Arr <> nil then
+        begin
+          Result := False;
+          for i := 0 to Arr.Count - 1 do
+            if Arr.Items[i].FindPath('id').AsString = ModelName then
+            begin
+              Result := True;
+              Break;
+            end;
+        end;
+      finally
+        J.Free;
+      end;
+    end;
+  except
+    Result := True; // network error — don't block the user
+  end;
+end;
+
+procedure TDCLLM.SetModel(ChatId: UInt64; const ModelName: string);
+begin
+  if not ModelAvailable(ModelName) then
+    raise Exception.CreateFmt('Модель "%s" не в списке доступных (полный список: /model)', [ModelName]);
+  EnsureChat(ChatId);
+  FModelCache[ChatId] := ModelName;
+  SaveMeta(ChatId);
+end;
+
+function TDCLLM.ResolveSession(ChatId: UInt64): string;
+var
+  Body, Resp: string;
+  J: TJSONData;
+  Status: Integer;
+begin
+  EnsureChat(ChatId);
+  if FSessionCache.IndexOf(ChatId) >= 0 then
+    Exit(FSessionCache[ChatId]);
+  // no conversation yet — create a new one on the Drift side (new session)
+  Body := '{"title":"dcbot chat ' + IntToStr(ChatId) + '"}';
+  Resp := DoRequest('POST', FConfig.BaseURL + '/conversations', Body, Status);
+  if (Status < 200) or (Status >= 300) then
+    raise Exception.CreateFmt('create conversation HTTP %d: %s', [Status, Copy(Resp, 1, 200)]);
+  J := GetJSON(Resp);
+  try
+    Result := SafeStr(J, 'id');
+    if Result = 'null' then
+      raise Exception.Create('create conversation: no "id" in response');
+  finally
+    J.Free;
+  end;
+  FSessionCache[ChatId] := Result;
+  SaveMeta(ChatId);
+  WriteLn(Format('DEBUG drift session created for chat %d: %s', [ChatId, Result]));
+end;
+
+{ Percent-encode a UTF-8 string for use in a URL query. }
+function UrlEncode(const S: string): string;
+var
+  i: Integer;
+begin
+  Result := '';
+  for i := 1 to Length(S) do
+  begin
+    if S[i] in ['a'..'z', 'A'..'Z', '0'..'9', '-', '_', '.', '~'] then
+      Result := Result + S[i]
+    else
+      Result := Result + '%' + IntToHex(Ord(S[i]), 2);
+  end;
+end;
+
+{ Escape a string for embedding inside a JSON string literal. }
+function JsonEscape(const S: string): string;
+var
+  i: Integer;
+begin
+  Result := '';
+  for i := 1 to Length(S) do
+    case S[i] of
+      '"': Result := Result + '\"';
+      '\': Result := Result + '\\';
+      #10: Result := Result + '\n';
+      #13: Result := Result + '\r';
+      #9:  Result := Result + '\t';
+      else Result := Result + S[i];
+    end;
+end;
+
+function TDCLLM.Search(const Kind, Query: string): string;
+const
+  Limit = 5;
+var
+  Url, Body, Resp: string;
+  J: TJSONData;
+  Arr: TJSONArray;
+  Item: TJSONData;
+  i: Integer;
+  Title, Link, Text: string;
+  SL: TStringList;
+  Status: Integer;
+begin
+  Url := FConfig.BaseURL + '/search/';
+  if Kind = 'tg' then
+  begin
+    // GET with query params (cheap Telegram-channel search)
+    Url := Url + 'tg?q=' + UrlEncode(Query) + '&limit=' + IntToStr(Limit);
+    Body := '';
+    Resp := DoRequest('GET', Url, Body, Status);
+  end
+  else
+  begin
+    // web / crawl: POST JSON
+    Url := Url + Kind;
+    if Kind = 'crawl' then
+      Body := '{"url":"' + JsonEscape(Query) + '","limit":' + IntToStr(Limit) + '}'
+    else
+      Body := '{"query":"' + JsonEscape(Query) + '","limit":' + IntToStr(Limit) + '}';
+    Resp := DoRequest('POST', Url, Body, Status);
+  end;
+  if (Status < 200) or (Status >= 300) then
+    raise Exception.CreateFmt('Search HTTP %d: %s', [Status, Copy(Resp, 1, 200)]);
+  J := GetJSON(Resp);
+  try
+    Arr := J.FindPath('results') as TJSONArray;
+    SL := TStringList.Create;
+    try
+      if Arr = nil then
+        SL.Add('(нет поля results в ответе)')
+      else if Arr.Count = 0 then
+        SL.Add('Ничего не найдено.')
+      else
+        for i := 0 to Arr.Count - 1 do
+        begin
+          Item := Arr.Items[i];
+          Title := SafeStr(Item, 'title');
+          if Title = 'null' then Title := SafeStr(Item, 'channel');
+          if Title = 'null' then Title := SafeStr(Item, 'name');
+          if Title = 'null' then Title := '';
+          Link := SafeStr(Item, 'url');
+          if Link = 'null' then Link := SafeStr(Item, 'link');
+          if Link = 'null' then Link := '';
+          Text := SafeStr(Item, 'text');
+          if Text = 'null' then Text := SafeStr(Item, 'snippet');
+          if Text = 'null' then Text := SafeStr(Item, 'description');
+          if Text = 'null' then Text := '';
+          if Link <> '' then
+            SL.Add(Format('%d. %s — %s', [i + 1, Title, Link]))
+          else
+            SL.Add(Format('%d. %s', [i + 1, Title]));
+          if Text <> '' then
+            SL.Add('   ' + Copy(Text, 1, 200));
+        end;
+      Result := SL.Text;
+    finally
+      SL.Free;
+    end;
+  finally
+    J.Free;
+  end;
+end;
+
+procedure TDCLLM.ClearContext(ChatId: UInt64);
+begin
+  if FIsDrift then
+  begin
+    // New Drift session: the provider keeps per-conversation memory, so we
+    // simply forget the old conversation_id — the next request creates a new one.
+    EnsureChat(ChatId);
+    if FSessionCache.IndexOf(ChatId) >= 0 then
+    begin
+      FSessionCache.Remove(ChatId);
+      SaveMeta(ChatId);
+    end;
+    WriteLn(Format('DEBUG drift session reset for chat %d', [ChatId]));
+  end
+  else
+  begin
+    // Hub: wipe the in-memory history and delete the history file.
+    EnsureChat(ChatId);
+    FHistory[ChatId].Free;
+    FHistory[ChatId] := TJSONArray.Create;
+    if FileExists(HistoryPath(ChatId)) then
+      DeleteFile(HistoryPath(ChatId));
+    WriteLn(Format('DEBUG context cleared for chat %d', [ChatId]));
+  end;
 end;
 
 initialization
