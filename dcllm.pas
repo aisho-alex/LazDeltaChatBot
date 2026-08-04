@@ -745,7 +745,7 @@ begin
     SL := TStringList.Create;
     try
       if Arr = nil then
-        SL.Add('(нет поля results в ответе)')
+        SL.Add('(нет поля results; сырой ответ: ' + Copy(Resp, 1, 300) + ')')
       else if Arr.Count = 0 then
         SL.Add('Ничего не найдено.')
       else
@@ -758,10 +758,12 @@ begin
           if Title = 'null' then Title := '';
           Link := SafeStr(Item, 'url');
           if Link = 'null' then Link := SafeStr(Item, 'link');
+          if Link = 'null' then Link := SafeStr(Item, 'message_url'); // TG
           if Link = 'null' then Link := '';
           Text := SafeStr(Item, 'text');
           if Text = 'null' then Text := SafeStr(Item, 'snippet');
           if Text = 'null' then Text := SafeStr(Item, 'description');
+          if Text = 'null' then Text := SafeStr(Item, 'content'); // web
           if Text = 'null' then Text := '';
           if Link <> '' then
             SL.Add(Format('%d. %s — %s', [i + 1, Title, Link]))
