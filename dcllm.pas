@@ -91,6 +91,10 @@ type
       history and deletes the history file. For Drift: creates a NEW
       conversation (new session), since Drift keeps its own memory. }
     procedure ClearContext(ChatId: UInt64);
+    { Replaces invalid UTF-8 sequences with '?'. Use before sending any
+      user-visible text: deltachat-rpc-server dies on broken UTF-8
+      ("stream did not contain valid UTF-8"). }
+    function SanitizeUtf8(const S: string): string;
   end;
 
 implementation
@@ -706,6 +710,73 @@ begin
     end;
 end;
 
+{ Copies up to MaxLen bytes of S, never splitting a UTF-8 multi-byte char.
+  Returns the whole string if it fits. }
+function SafeCopyUtf8(const S: string; MaxLen: Integer): string;
+var
+  i: Integer;
+begin
+  if Length(S) <= MaxLen then
+    Exit(S);
+  i := MaxLen;
+  // step back over UTF-8 continuation bytes (0x80..0xBF) to the lead byte
+  while (i > 1) and ((Ord(S[i]) and $C0) = $80) do
+    Dec(i);
+  Result := Copy(S, 1, i - 1);
+end;
+
+function TDCLLM.SanitizeUtf8(const S: string): string;
+var
+  i, k, n, L: Integer;
+  b: Byte;
+  OK: Boolean;
+begin
+  Result := '';
+  i := 1;
+  L := Length(S);
+  while i <= L do
+  begin
+    b := Ord(S[i]);
+    if b < $80 then
+      n := 1
+    else if (b and $E0) = $C0 then n := 2
+    else if (b and $F0) = $E0 then n := 3
+    else if (b and $F8) = $F0 then n := 4
+    else n := 0; // 0x80..0xBF (stray continuation) or 0xF8+ (invalid lead)
+    OK := (n > 0) and (i + n - 1 <= L);
+    if OK and (n > 1) then
+      case n of
+        2: if b < $C2 then OK := False; // 0xC0/0xC1 overlong encodings
+        3: begin
+             if (b = $E0) and (Ord(S[i + 1]) < $A0) then OK := False; // overlong
+             if (b = $ED) and (Ord(S[i + 1]) > $9F) then OK := False; // surrogate
+           end;
+        4: begin
+             if (b = $F0) and (Ord(S[i + 1]) < $90) then OK := False; // overlong
+             if (b = $F4) and (Ord(S[i + 1]) > $8F) then OK := False; // > U+10FFFF
+             if b > $F4 then OK := False; // invalid lead
+           end;
+      end;
+    if OK and (n > 1) then
+      for k := 1 to n - 1 do
+        if (Ord(S[i + k]) and $C0) <> $80 then
+        begin
+          OK := False;
+          Break;
+        end;
+    if OK then
+    begin
+      Result := Result + Copy(S, i, n);
+      Inc(i, n);
+    end
+    else
+    begin
+      Result := Result + '?';
+      Inc(i);
+    end;
+  end;
+end;
+
 function TDCLLM.Search(const Kind, Query: string): string;
 const
   Limit = 5;
@@ -742,6 +813,8 @@ begin
   J := GetJSON(Resp);
   try
     Arr := J.FindPath('results') as TJSONArray;
+    if Arr = nil then
+      Arr := J.FindPath('pages') as TJSONArray; // /search/crawl returns pages
     SL := TStringList.Create;
     try
       if Arr = nil then
@@ -770,7 +843,7 @@ begin
           else
             SL.Add(Format('%d. %s', [i + 1, Title]));
           if Text <> '' then
-            SL.Add('   ' + Copy(Text, 1, 200));
+            SL.Add('   ' + SafeCopyUtf8(Text, 200));
         end;
       Result := SL.Text;
     finally

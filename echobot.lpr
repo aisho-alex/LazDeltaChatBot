@@ -38,6 +38,14 @@ begin
   end;
 end;
 
+{ Send a text message, sanitizing broken UTF-8 first. deltachat-rpc-server
+  dies on invalid UTF-8 ("stream did not contain valid UTF-8"), which used
+  to crash the bot when search snippets were cut mid multi-byte char. }
+procedure SendMsg(AccId: TAccountId; ChatId: TChatId; const Text: string);
+begin
+  Client.MiscSendTextMessage(AccId, ChatId, LLM.SanitizeUtf8(Text));
+end;
+
 procedure HandleNewMsg(AccId: TAccountId; MsgId: TMsgId);
 var
   Snap: TMsgSnapshot;
@@ -64,13 +72,13 @@ begin
       begin
         Auth.Authorize(Snap.FromId);
         WriteLn(Format('DEBUG authorized contact %d', [Snap.FromId]));
-        Client.MiscSendTextMessage(AccId, Snap.ChatId, '✅ Авторизация пройдена. Добро пожаловать!');
+        SendMsg(AccId, Snap.ChatId, '✅ Авторизация пройдена. Добро пожаловать!');
       end
       else
-        Client.MiscSendTextMessage(AccId, Snap.ChatId, '🔒 Неверный код. Доступ запрещён.');
+        SendMsg(AccId, Snap.ChatId, '🔒 Неверный код. Доступ запрещён.');
     end
     else if Text = '/start' then
-      Client.MiscSendTextMessage(AccId, Snap.ChatId, '🔒 Отправь /start <кодовая фраза> для авторизации')
+      SendMsg(AccId, Snap.ChatId, '🔒 Отправь /start <кодовая фраза> для авторизации')
     else
       WriteLn(Format('DEBUG ignoring message from unauthorized contact %d', [Snap.FromId]));
     Exit;
@@ -79,7 +87,7 @@ begin
   if Text = '/start' then
   begin
     WriteLn('DEBUG replying with "работаю" to /start');
-    Client.MiscSendTextMessage(AccId, Snap.ChatId, 'работаю');
+    SendMsg(AccId, Snap.ChatId, 'работаю');
     Exit;
   end;
 
@@ -92,7 +100,7 @@ begin
   // --- bot commands ---
   if Text = '/help' then
   begin
-    Client.MiscSendTextMessage(AccId, Snap.ChatId,
+    SendMsg(AccId, Snap.ChatId,
       'Команды:' + LineEnding +
       '/model — текущая модель и список доступных' + LineEnding +
       '/model <имя> — сменить модель для этого чата' + LineEnding +
@@ -127,7 +135,7 @@ begin
           Reply := '❌ ' + E.Message;
       end;
     end;
-    Client.MiscSendTextMessage(AccId, Snap.ChatId, Reply);
+    SendMsg(AccId, Snap.ChatId, Reply);
     Exit;
   end;
 
@@ -143,7 +151,7 @@ begin
       on E: Exception do
         Reply := '❌ ' + E.Message;
     end;
-    Client.MiscSendTextMessage(AccId, Snap.ChatId, Reply);
+    SendMsg(AccId, Snap.ChatId, Reply);
     Exit;
   end;
 
@@ -174,7 +182,7 @@ begin
           Reply := '❌ Ошибка поиска: ' + E.Message;
       end;
     end;
-    Client.MiscSendTextMessage(AccId, Snap.ChatId, Reply);
+    SendMsg(AccId, Snap.ChatId, Reply);
     Exit;
   end;
 
@@ -197,7 +205,7 @@ begin
   if Reply <> '' then
   begin
     WriteLn(Format('DEBUG LLM <- chat=%d (%d chars)', [Snap.ChatId, Length(Reply)]));
-    Client.MiscSendTextMessage(AccId, Snap.ChatId, Reply);
+    SendMsg(AccId, Snap.ChatId, Reply);
   end;
 end;
 
