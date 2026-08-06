@@ -1,12 +1,13 @@
-# Echo Bot - Free Pascal
+# LazDeltaChatBot
 
-A Free Pascal port of the Delta Chat echo bot that talks to
+A Free Pascal Delta Chat bot that talks to
 [deltachat-rpc-server](https://github.com/chatmail/core/tree/master/deltachat-rpc-server)
 via JSON-RPC over stdio.
 
 On the wire the bot replies to `/start` with the literal string
-`работаю`; every other text message from a real contact is forwarded to an
-LLM (see "LLM replies" below) and the model's answer is sent back.
+`работаю` (health check); every other text message from a real contact is
+forwarded to an LLM (see "LLM replies" below) and the model's answer is
+sent back. With no `LLM_API_KEY` the bot falls back to plain echo mode.
 
 ## LLM replies
 
