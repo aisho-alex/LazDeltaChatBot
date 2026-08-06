@@ -1,102 +1,108 @@
 # LazDeltaChatBot
 
-A Free Pascal Delta Chat bot that talks to
+Бот для Delta Chat на Free Pascal, общающийся с
 [deltachat-rpc-server](https://github.com/chatmail/core/tree/master/deltachat-rpc-server)
-via JSON-RPC over stdio.
+через JSON-RPC поверх stdio.
 
-On the wire the bot replies to `/start` with the literal string
-`работаю` (health check); every other text message from a real contact is
-forwarded to an LLM (see "LLM replies" below) and the model's answer is
-sent back. With no `LLM_API_KEY` the bot falls back to plain echo mode.
+При получении `/start` бот отвечает строкой `работаю` (проверка работоспособности);
+все остальные текстовые сообщения от реальных контактов пересылаются LLM
+(см. раздел «Ответы через LLM»), а ответ модели отправляется обратно.
+Если переменная `LLM_API_KEY` не задана, бот работает в режиме простого эха.
 
-## LLM replies
+## Ответы через LLM
 
-The bot speaks the OpenAI-compatible `/v1/chat/completions` protocol, so it
-works against any provider that exposes it — neuraldeep Hub, Drift, a local
-Hermes gateway `api_server`, etc. The backend is selected purely via
-environment variables; no code changes needed.
+Бот использует OpenAI-совместимый протокол `/v1/chat/completions`, поэтому
+работает с любым провайдером, который его поддерживает — neuraldeep Hub,
+Drift, локальный шлюз Hermes `api_server` и т. п. Бэкенд выбирается
+исключительно через переменные окружения; менять код не нужно.
 
-| Variable         | Description                                             | Default                          |
-|------------------|---------------------------------------------------------|----------------------------------|
-| `LLM_BASE_URL`   | API base URL                                            | `https://api.neuraldeep.ru/v1`   |
-| `LLM_API_KEY`    | Bearer token (`sk-*` for Hub, `dft_*` for Drift, …)     | *(empty = LLM disabled)*         |
-| `LLM_MODEL`      | Model name                                              | `gpt-oss-120b`                   |
-| `LLM_SYSTEM`     | System prompt                                           | short Russian assistant prompt   |
-| `LLM_TIMEOUT`    | Connect + I/O timeout, seconds                          | `120`                            |
-| `LLM_MAX_TOKENS` | Max output tokens (reasoning models need headroom)      | `1024`                           |
-| `LLM_TEMPERATURE`| Sampling temperature                                    | `0.2`                            |
-| `LLM_HISTORY`    | Messages kept per chat (multi-turn context)             | `20`                             |
-| `LLM_HISTORY_DIR`| Directory for per-chat history files (`<chatId>.json`)  | `history`                        |
-| `LLM_RETRIES`    | Extra attempts on 429 / 5xx / network errors            | `2`                              |
+| Переменная        | Описание                                                | Значение по умолчанию           |
+|-------------------|---------------------------------------------------------|---------------------------------|
+| `LLM_BASE_URL`    | Базовый URL API                                         | `https://api.neuraldeep.ru/v1`  |
+| `LLM_API_KEY`     | Bearer-токен (`sk-*` для Hub, `dft_*` для Drift, …)     | *(пусто = LLM отключён)*        |
+| `LLM_MODEL`       | Имя модели                                              | `gpt-oss-120b`                  |
+| `LLM_SYSTEM`      | Системный промпт                                        | краткий промпт русскоязычного ассистента |
+| `LLM_TIMEOUT`     | Таймаут соединения и I/O, секунды                       | `120`                           |
+| `LLM_MAX_TOKENS`  | Максимум токенов в ответе (моделям с рассуждениями нужен запас) | `1024`                    |
+| `LLM_TEMPERATURE` | Температура сэмплирования                               | `0.2`                           |
+| `LLM_HISTORY`     | Количество хранимых сообщений на чат (мульти-тур контекст) | `20`                          |
+| `LLM_HISTORY_DIR` | Каталог для файлов истории по чатам (`<chatId>.json`)   | `history`                       |
+| `LLM_RETRIES`     | Дополнительные попытки при 429 / 5xx / сетевых ошибках  | `2`                             |
 
-Example (neuraldeep Hub, model with long context):
+Пример (neuraldeep Hub, модель с длинным контекстом):
 
 ```sh
 LLM_API_KEY=sk-... LLM_MODEL=qwen3.6-35b-a3b ./echobot
 ```
 
-Behavior notes:
+Особенности поведения:
 
-- `/start` always replies `работаю` without calling the LLM (health check).
-- Chat commands (all except `/start` require an authorized contact):
-  - `/model` — show the current per-chat model and the list from `GET /v1/models`
-  - `/model <name>` — switch the model for this chat (persisted in
-    `LLM_HISTORY_DIR/<chatId>.meta`, survives restarts)
-  - `/search <query>` — web search; `/search tg <query>` — Telegram-channel
-    search; `/search crawl <url>` — crawl a site (neuraldeep Search API,
-    same key, separate quota; 5 results)
-  - `/clear` — reset the chat context: for Hub backends wipes the in-memory
-    history and deletes `<chatId>.json`; for Drift forgets the
-    `conversation_id` so the next request starts a NEW session on the
-    provider side
-  - `/help` — list of commands
-- When `LLM_BASE_URL` contains `drift`, the bot talks to Drift: it sends
-  only the latest user prompt plus `conversation_id` (Drift keeps its own
-  per-conversation memory in its DB, so sending history would duplicate it).
-  A new conversation is created automatically on first use.
-- The last `LLM_HISTORY` messages per chat are sent along, so multi-turn
-  conversations have context. History is updated only on success, so a
-  failed call never poisons the next request.
-- History is persisted to `LLM_HISTORY_DIR/<chatId>.json` after every
-  successful exchange (atomic write via `.tmp` + rename) and reloaded on
-  startup, so conversations survive bot restarts (e.g. watchdog-triggered).
-  A missing/corrupt file is logged and ignored — the chat starts fresh.
-- Each chat pins an upstream worker via the `user: dcbot:<chatId>` field
-  (session-sticky routing keeps the KV cache warm on the Hub).
-- Rate limits (429) and transient errors are retried with a short backoff
-  honoring `Retry-After`; client errors (401/400) are logged and skipped.
-- If the model returns null/empty content (e.g. a reasoning model that
-  spent the whole token budget), the request is retried once, then the
-  error is logged with the raw response snippet.
-- With no `LLM_API_KEY` the bot falls back to the plain echo behavior.
+- `/start` всегда отвечает `работаю` без обращения к LLM (проверка работоспособности).
+- Команды чата (все, кроме `/start`, требуют авторизованного контакта):
+  - `/model` — показать текущую модель для чата и список из `GET /v1/models`
+  - `/model <имя>` — переключить модель для этого чата (сохраняется в
+    `LLM_HISTORY_DIR/<chatId>.meta`, переживает перезапуски)
+  - `/search <запрос>` — веб-поиск; `/search tg <запрос>` — поиск по
+    Telegram-каналам; `/search crawl <url>` — обход сайта (Search API
+    neuraldeep, тот же ключ, отдельная квота; 5 результатов)
+  - `/clear` — сбросить контекст чата: для Hub-бэкендов очищает
+    историю в памяти и удаляет файл `<chatId>.json`; для Drift забывает
+    `conversation_id`, поэтому следующий запрос начнёт НОВУЮ сессию
+    на стороне провайдера
+  - `/help` — список команд
+- Если `LLM_BASE_URL` содержит `drift`, бот общается с Drift: отправляет
+  только последний пользовательский промпт плюс `conversation_id`
+  (Drift хранит собственную память диалогов в своей БД, поэтому
+  отправлять историю означало бы её дублировать). Новый диалог
+  создаётся автоматически при первом использовании.
+- Вместе с запросом отправляются последние `LLM_HISTORY` сообщений чата,
+  поэтому диалог сохраняет контекст между репликами. История обновляется
+  только при успешном ответе — провальный вызов не отравляет следующий
+  запрос.
+- История сохраняется в `LLM_HISTORY_DIR/<chatId>.json` после каждого
+  успешного обмена сообщениями (атомарная запись через `.tmp` +
+  переименование) и подгружается при старте, поэтому диалоги переживают
+  перезапуски бота (в том числе вызванные ватчдогом). Отсутствующий или
+  повреждённый файл логируется и игнорируется — чат начинается заново.
+- Каждый чат привязывается к апстрим-воркеру через поле
+  `user: dcbot:<chatId>` (роутинг с привязкой к сессии держит KV-кэш
+  тёплым на Hub).
+- При превышении лимита запросов (429) и транзиентных ошибках
+  выполняется повторная попытка с короткой задержкой и учётом
+  `Retry-After`; клиентские ошибки (401/400) логируются и пропускаются.
+- Если модель вернула пустое содержимое (например, модель с рассуждениями
+  потратила весь бюджет токенов), запрос повторяется один раз, после
+  чего ошибка логируется вместе с фрагментом сырого ответа.
+- Если `LLM_API_KEY` не задан, бот работает в режиме простого эха.
 
-## Authorization
+## Авторизация
 
-When `BOT_AUTH_CODE` is set, the bot only talks to contacts that have
-authorized themselves once by sending:
+Если задана переменная `BOT_AUTH_CODE`, бот общается только с контактами,
+которые один раз авторизовались, отправив:
 
     /start <кодовая фраза>
 
-Authorized contact ids are stored in `accounts/authorized.txt`
-(override with `BOT_AUTH_FILE`), so access survives restarts. The file
-is gitignored and travels with the `accounts/` directory when you
-deploy elsewhere.
+ID авторизованных контактов хранятся в файле `accounts/authorized.txt`
+(переопределяется через `BOT_AUTH_FILE`), поэтому доступ переживает
+перезапуски. Файл добавлен в `.gitignore` и путешествует вместе с
+каталогом `accounts/` при деплое в другое место.
 
-| Variable        | Description                                     | Default                    |
-|-----------------|-------------------------------------------------|----------------------------|
-| `BOT_AUTH_CODE` | Secret phrase; empty = authorization disabled   | *(empty = open bot)*       |
-| `BOT_AUTH_FILE` | File with authorized contact ids (one per line) | `accounts/authorized.txt`  |
+| Переменная       | Описание                                              | Значение по умолчанию        |
+|------------------|-------------------------------------------------------|------------------------------|
+| `BOT_AUTH_CODE`  | Секретная фраза; пусто = авторизация отключена        | *(пусто = открытый бот)*     |
+| `BOT_AUTH_FILE`  | Файл с ID авторизованных контактов (по одному в строке)| `accounts/authorized.txt`    |
 
-Unauthorized contacts: `/start` alone gets a hint, a wrong code gets a
-rejection, any other message is ignored silently. Authorized contacts
-keep the usual behavior (`/start` → `работаю`, everything else → LLM).
+Неавторизованные контакты: `/start` без кода получает подсказку,
+неверный код — отказ, любое другое сообщение молча игнорируется.
+Авторизованные контакты сохраняют обычное поведение
+(`/start` → `работаю`, всё остальное → LLM).
 
-## Build & run
+## Сборка и запуск
 
-Prerequisites:
-- A POSIX shell with `curl` (Linux + macOS) or PowerShell 5+ (Windows)
+Необходимые зависимости:
+- POSIX-оболочка с `curl` (Linux + macOS) или PowerShell 5+ (Windows)
 - GNU Make
-- Free Pascal Compiler ≥ 3.3.1 (with units `rtl`, `rtl-objpas`,
+- Free Pascal Compiler ≥ 3.3.1 (с модулями `rtl`, `rtl-objpas`,
   `fcl-json`, `fcl-base`, `fcl-process`, `pthreads`)
 
 ```sh
@@ -104,31 +110,31 @@ cd freepascal
 make run
 ```
 
-`make` will:
-1. Download a standalone `deltachat-rpc-server` binary for the current
-   platform from the pinned GitHub release into `./.deps/` (cached on
-   subsequent builds).
-2. Compile `echobot` with the configured Free Pascal compiler.
-3. Launch `./echobot` with `DC_RPC_SERVER` pointed at the downloaded
-   binary.
+`make` выполнит:
+1. Скачает автономный бинарник `deltachat-rpc-server` для текущей
+   платформы из зафиксированного релиза на GitHub в `./.deps/`
+   (кэшируется для последующих сборок).
+2. Скомпилирует `echobot` указанным компилятором Free Pascal.
+3. Запустит `./echobot` с `DC_RPC_SERVER`, указывающим на скачанный
+   бинарник.
 
-Useful targets:
+Полезные цели:
 
-| Target             | What it does                                              |
-|--------------------|-----------------------------------------------------------|
-| `make deps`        | download `deltachat-rpc-server` (skipped if cached)       |
-| `make build`       | compile `echobot`                                          |
-| `make run`         | build + run with the right `DC_RPC_SERVER`                 |
-| `make clean`       | remove `echobot` and intermediate files                    |
-| `make clean-deps`  | also remove `./.deps/` (forces re-download)               |
+| Цель              | Что делает                                                |
+|-------------------|-----------------------------------------------------------|
+| `make deps`       | скачать `deltachat-rpc-server` (пропускается, если в кэше) |
+| `make build`      | скомпилировать `echobot`                                  |
+| `make run`        | собрать + запустить с правильным `DC_RPC_SERVER`          |
+| `make clean`      | удалить `echobot` и промежуточные файлы                   |
+| `make clean-deps` | также удалить `./.deps/` (принудительно перекачать)       |
 
-Overriding defaults:
+Переопределение значений по умолчанию:
 
 ```sh
-RPC_VERSION=v2.58.0 make deps     # use a newer release
+RPC_VERSION=v2.58.0 make deps     # использовать более новый релиз
 ```
 
-With fpcupdeluxe at `/home/alexander/fpcupdeluxe_trunc/fpc`:
+С fpcupdeluxe в `/home/alexander/fpcupdeluxe_trunc/fpc`:
 
 ```sh
 FPC=/home/alexander/fpcupdeluxe_trunc/fpc
@@ -141,52 +147,53 @@ FPC_UNITS="$FPC/units/x86_64-linux/rtl \
   make run
 ```
 
-The `FPC` variable may point at either an `fpc` binary directly or at an
-fpcupdeluxe-style tree root (in which case the Makefile picks
-`$FPC/bin/$(host-triple)/fpc` automatically). `FPC_UNITS` only needs
-to be set when the default FPC install does not pick up all required
-units from its own search paths.
+Переменная `FPC` может указывать как на бинарник `fpc` напрямую, так и
+на корень дерева fpcupdeluxe (в этом случае Makefile автоматически
+выбирает `$FPC/bin/$(host-triple)/fpc`). `FPC_UNITS` нужно задавать
+только когда стандартная установка FPC не находит все необходимые
+модули в собственных путях поиска.
 
-## Configuring the bot account
+## Настройка аккаунта бота
 
-The first time you run `./echobot`, pass the credentials as command line
-arguments:
+При первом запуске `./echobot` передайте учётные данные как аргументы
+командной строки:
 
 ```sh
 ./echobot $yourEmail $yourPassword
 ```
 
-This creates a subdirectory called `accounts` in the current working
-directory. Delta Chat state and the bot's credentials are stored there,
-so further invocations don't need them:
+Это создаст подкаталог `accounts` в текущем рабочем каталоге.
+Состояние Delta Chat и учётные данные бота хранятся там, поэтому
+последующие запуски не требуют аргументов:
 
 ```sh
 ./echobot
 ```
 
-Open a chat with the bot address in your Delta Chat and send `/start`.
-The bot replies with `работаю`.
+Откройте чат с адресом бота в вашем Delta Chat и отправьте `/start`.
+Бот ответит `работаю`.
 
-To deploy somewhere else, copy the whole `accounts/` directory along
-with the binary — it contains everything the bot needs to reconnect.
+Для деплоя в другое место скопируйте весь каталог `accounts/` вместе
+с бинарником — там всё, что нужно боту для переподключения.
 
-## Explicit IMAP/SMTP configuration
+## Явная настройка IMAP/SMTP
 
-Some providers (e.g. Yandex, Mail.ru, Outlook) require explicit server
-settings. Set the following environment variables before the first run:
+Некоторые провайдеры (например, Yandex, Mail.ru, Outlook) требуют
+явного указания параметров сервера. Перед первым запуском задайте
+следующие переменные окружения:
 
-| Variable      | Description                          |
-|---------------|--------------------------------------|
-| `MAIL_SERVER` | IMAP hostname                        |
-| `MAIL_PORT`   | IMAP port (usually 993)              |
-| `MAIL_USER`   | IMAP username (defaults to addr)     |
-| `SEND_SERVER` | SMTP hostname                        |
-| `SEND_PORT`   | SMTP port (usually 587 or 465)       |
-| `SEND_USER`   | SMTP username (defaults to addr)     |
-| `SEND_PW`     | SMTP password (defaults to mail_pw)  |
+| Переменная    | Описание                              |
+|---------------|---------------------------------------|
+| `MAIL_SERVER` | Хост IMAP                             |
+| `MAIL_PORT`   | Порт IMAP (обычно 993)                |
+| `MAIL_USER`   | Имя пользователя IMAP (по умолчанию адрес) |
+| `SEND_SERVER` | Хост SMTP                             |
+| `SEND_PORT`   | Порт SMTP (обычно 587 или 465)        |
+| `SEND_USER`   | Имя пользователя SMTP (по умолчанию адрес) |
+| `SEND_PW`     | Пароль SMTP (по умолчанию `mail_pw`)  |
 
-Example for Yandex (enable IMAP in Yandex Mail settings and create an
-app password at id.yandex.ru/security):
+Пример для Yandex (включите IMAP в настройках Яндекс.Почты и создайте
+пароль приложения на id.yandex.ru/security):
 
 ```sh
 MAIL_SERVER=imap.yandex.com MAIL_PORT=993 \
@@ -194,31 +201,33 @@ SEND_SERVER=smtp.yandex.com SEND_PORT=465 \
 ./echobot $yourYandexAddr $yourAppPassword
 ```
 
-> Note: Outlook.com / Office365 (`outlook.office365.com`) no longer
-> works for bots. Microsoft has disabled Basic Auth (IMAP `AUTHENTICATE
-> PLAIN`) for these accounts, and `deltachat-rpc-server` does not expose
-> OAuth2, so the bot cannot log in there. Use a provider that still
-> supports app-password Basic Auth (Yandex, Mail.ru, Gmail with an app
-> password) or a chatmail relay instead.
+> Примечание: Outlook.com / Office365 (`outlook.office365.com`) больше
+> не работает для ботов. Microsoft отключила Basic Auth (IMAP
+> `AUTHENTICATE PLAIN`) для этих аккаунтов, а `deltachat-rpc-server`
+> не предоставляет OAuth2, поэтому бот не может туда войти.
+> Используйте провайдера, который всё ещё поддерживает Basic Auth
+> с паролями приложений (Yandex, Mail.ru, Gmail с паролем приложения)
+> или ретранслятор chatmail.
 
-## End-to-end encryption caveats
+## Предостережения по сквозному шифрованию
 
-The bot's `accounts/<uuid>/dc.db` is the runtime database. For the bot
-to send end-to-end encrypted replies to a contact, three things must
-be true:
+База данных рантайма бота — `accounts/<uuid>/dc.db`. Чтобы бот мог
+отправлять сквозно зашифрованные ответы контакту, должны выполняться
+три условия:
 
-1. `force_encryption=0` in the `config` table. The upstream default
-   is `1`, which makes `prefetch_should_download` discard plaintext
-   DC messages entirely, so the bot won't even see them.
-2. The bot has its own keypair in the `keypairs` table (generated the
-   first time you `configure()` the account). On Linux this happens
-   automatically when you pass credentials to the bot on first run.
-3. For each contact the bot will send encrypted replies to, the
-   contact's `fingerprint` column must be populated with the contact's
-   public-key fingerprint from `public_keys`. The upstream main branch
-   does **not** link these automatically when an Autocrypt header
-   arrives, so for any newly seen contact you have to run a one-off
-   SQL update:
+1. `force_encryption=0` в таблице `config`. Апстрим-значение по
+   умолчанию — `1`, из-за чего `prefetch_should_download` полностью
+   отбрасывает открытые сообщения DC, и бот их даже не видит.
+2. У бота есть собственная пара ключей в таблице `keypairs`
+   (генерируется при первом вызове `configure()` для аккаунта).
+   В Linux это происходит автоматически при передаче учётных данных
+   боту при первом запуске.
+3. Для каждого контакта, которому бот будет отправлять зашифрованные
+   ответы, колонка `fingerprint` в таблице `contacts` должна быть
+   заполнена отпечатком открытого ключа контакта из `public_keys`.
+   В апстрим-ветке main эта связь **не** устанавливается автоматически
+   при получении заголовка Autocrypt, поэтому для каждого нового
+   контакта нужно выполнить одноразовое обновление SQL:
 
    ```sql
    UPDATE contacts
@@ -227,5 +236,5 @@ be true:
    WHERE id = :contact_id AND (fingerprint IS NULL OR fingerprint = '');
    ```
 
-   until that upstream bug is fixed. The conversation will still be
-   transport-encrypted via SMTP TLS in the meantime.
+   пока соответствующий баг не будет исправлен апстримом. До этого
+   переписка остаётся защищённой транспортным TLS через SMTP.
