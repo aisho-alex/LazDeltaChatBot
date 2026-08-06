@@ -12,13 +12,13 @@
 ## Ответы через LLM
 
 Бот использует OpenAI-совместимый протокол `/v1/chat/completions`, поэтому
-работает с любым провайдером, который его поддерживает — neuraldeep Hub,
+работает с любым провайдером, который его поддерживает — [neuraldeep Hub](https://neuraldeep.ru),
 Drift, локальный шлюз Hermes `api_server` и т. п. Бэкенд выбирается
 исключительно через переменные окружения; менять код не нужно.
 
 | Переменная        | Описание                                                | Значение по умолчанию           |
 |-------------------|---------------------------------------------------------|---------------------------------|
-| `LLM_BASE_URL`    | Базовый URL API                                         | `https://api.neuraldeep.ru/v1`  |
+| `LLM_BASE_URL`    | Базовый URL API ([neuraldeep Hub](https://neuraldeep.ru) по умолчанию) | `https://api.neuraldeep.ru/v1`  |
 | `LLM_API_KEY`     | Bearer-токен (`sk-*` для Hub, `dft_*` для Drift, …)     | *(пусто = LLM отключён)*        |
 | `LLM_MODEL`       | Имя модели                                              | `gpt-oss-120b`                  |
 | `LLM_SYSTEM`      | Системный промпт                                        | краткий промпт русскоязычного ассистента |
@@ -29,7 +29,7 @@ Drift, локальный шлюз Hermes `api_server` и т. п. Бэкенд �
 | `LLM_HISTORY_DIR` | Каталог для файлов истории по чатам (`<chatId>.json`)   | `history`                       |
 | `LLM_RETRIES`     | Дополнительные попытки при 429 / 5xx / сетевых ошибках  | `2`                             |
 
-Пример (neuraldeep Hub, модель с длинным контекстом):
+Пример ([neuraldeep Hub](https://neuraldeep.ru), модель с длинным контекстом):
 
 ```sh
 LLM_API_KEY=sk-... LLM_MODEL=qwen3.6-35b-a3b ./echobot
@@ -44,7 +44,7 @@ LLM_API_KEY=sk-... LLM_MODEL=qwen3.6-35b-a3b ./echobot
     `LLM_HISTORY_DIR/<chatId>.meta`, переживает перезапуски)
   - `/search <запрос>` — веб-поиск; `/search tg <запрос>` — поиск по
     Telegram-каналам; `/search crawl <url>` — обход сайта (Search API
-    neuraldeep, тот же ключ, отдельная квота; 5 результатов)
+    [neuraldeep](https://neuraldeep.ru), тот же ключ, отдельная квота; 5 результатов)
   - `/clear` — сбросить контекст чата: для Hub-бэкендов очищает
     историю в памяти и удаляет файл `<chatId>.json`; для Drift забывает
     `conversation_id`, поэтому следующий запрос начнёт НОВУЮ сессию
