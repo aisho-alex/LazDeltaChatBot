@@ -10,3 +10,4 @@ accounts/
 *.db-wal
 *.db-blobs
 .deps/
+deploy.sh
