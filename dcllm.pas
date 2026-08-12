@@ -79,8 +79,13 @@ type
     function Complete(ChatId: UInt64; const UserText: string): string;
     { Current per-chat model (defaults to LLM_MODEL). }
     function ChatModel(ChatId: UInt64): string;
-    { Comma-separated model ids from GET /v1/models. Raises on failure. }
+    { Sorted, newline-separated model ids from GET /v1/models, prefixed with
+      a "1. ", "2. ", … counter. Begins with a header line "Доступные модели (N):".
+      Raises on failure. }
     function AvailableModels: string;
+    { Like AvailableModels, but additionally marks the chat's current model
+      with a trailing " ✅" so the user can see at a glance which one is active. }
+    function FormatModelsForChat(ChatId: UInt64): string;
     { Sets the per-chat model, validating against /v1/models when the
       provider exposes it. Raises if the model is not in the list. }
     procedure SetModel(ChatId: UInt64; const ModelName: string);
@@ -598,12 +603,52 @@ begin
       for i := 0 to Arr.Count - 1 do
         Ids.Add(Arr.Items[i].FindPath('id').AsString);
       Ids.Sort;
-      Result := Ids.CommaText;
+      if Ids.Count = 0 then
+        Result := 'Доступные модели: (пусто)'
+      else
+      begin
+        Result := Format('Доступные модели (%d):', [Ids.Count]);
+        for i := 0 to Ids.Count - 1 do
+          Result := Result + LineEnding + Format('%d. %s', [i + 1, Ids[i]]);
+      end;
     finally
       Ids.Free;
     end;
   finally
     J.Free;
+  end;
+end;
+
+function TDCLLM.FormatModelsForChat(ChatId: UInt64): string;
+var
+  Current, Line, AfterDot: string;
+  Lines: TStringList;
+  i, DotPos: Integer;
+begin
+  Result := AvailableModels;
+  Current := ChatModel(ChatId);
+  if Current = '' then
+    Exit;
+  Lines := TStringList.Create;
+  try
+    Lines.Text := Result;
+    for i := 0 to Lines.Count - 1 do
+    begin
+      Line := Lines[i];
+      DotPos := Pos('. ', Line);
+      if (DotPos > 1) and (DotPos <= 4) then
+      begin
+        AfterDot := Copy(Line, DotPos + 2, Length(Line) - DotPos - 1);
+        if AfterDot = Current then
+        begin
+          Lines[i] := Line + ' ✅';
+          Break;
+        end;
+      end;
+    end;
+    Result := Lines.Text;
+  finally
+    Lines.Free;
   end;
 end;
 

@@ -119,7 +119,7 @@ begin
     begin
       try
         Reply := 'Модель чата: ' + LLM.ChatModel(Snap.ChatId) + LineEnding +
-                 'Доступные: ' + LLM.AvailableModels;
+                 LLM.FormatModelsForChat(Snap.ChatId);
       except
         on E: Exception do
           Reply := 'Ошибка: ' + E.Message;
