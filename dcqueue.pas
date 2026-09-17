@@ -95,7 +95,13 @@ const
 
 function UnixNow: Int64;
 begin
-  Result := DateTimeToUnix(Now);
+  { AInputIsUTC=False обязательно: Now — это ЛОКАЛЬНОЕ время, а FileGetDate
+    отдаёт настоящий Unix-epoch (UTC). Со значением по умолчанию (True) возраст
+    файла завышался на смещение пояса (для MSK это +3 ч = 10800 с), то есть
+    больше QUEUE_CLAIM_TIMEOUT, и бот возвращал в inbox даже свежезабранную
+    задачу — она выполнялась по кругу. Проверено пробником: 10802 с против
+    правильных 2 с. }
+  Result := DateTimeToUnix(Now, False);
 end;
 
 { mtime файла как Unix-время; 0 если файла нет. }
@@ -133,7 +139,9 @@ constructor TTaskQueue.Create(const ARoot, ALocalWorker: string;
   APollMs, AClaimTimeoutSec: Integer; ADeliver: TTaskDeliverProc);
 begin
   inherited Create(True); // suspended: fields must be set before Execute runs
-  FRoot := ARoot;
+  { Абсолютный путь: в журнале должно быть видно /opt/echo-bot/queue, а не
+    относительное «queue», иначе при разборе инцидента непонятно, куда смотреть. }
+  FRoot := ExpandFileName(ARoot);
   FLocalWorker := ALocalWorker;
   FPollMs := APollMs;
   if FPollMs < 1000 then FPollMs := 1000;
