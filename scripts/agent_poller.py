@@ -59,7 +59,15 @@ def log(msg: str) -> None:
 
 
 class Transport:
-    """Доступ к каталогу очереди: напрямую (local) или через ssh."""
+    """Доступ к каталогу очереди: напрямую (local) или через ssh.
+
+    Важная тонкость ssh: он передаёт удалённой стороне ОДНУ строку, которую
+    переразбирает её login-shell. Поэтому команду надо отдавать одним
+    аргументом в кавычках — иначе `["bash", "-lc", "ls -1 /path"]` доедет как
+    `bash -lc ls -1 /path`, bash возьмёт `ls` как строку команды, `-1` уедет
+    в $0, и всё молча отработает не туда (типичный источник таких багов —
+    ещё и `2>/dev/null`, который прячет ошибку).
+    """
 
     def __init__(self, mode: str, host: str, queue: str) -> None:
         self.mode = mode
@@ -69,100 +77,133 @@ class Transport:
         if mode == "ssh" and not self.ssh:
             raise SystemExit("ssh не найден в PATH (нужен для --transport ssh)")
 
-    # --- низкий уровень ---------------------------------------------------
-    def _argv(self, args: list[str]) -> list[str]:
+    def _argv(self, remote_cmd: str) -> list[str]:
         if self.mode == "local":
-            return args
-        return [self.ssh, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", self.host] + args
+            return ["bash", "-lc", remote_cmd]
+        assert self.ssh
+        return [
+            self.ssh, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+            self.host, f"bash -lc {shlex.quote(remote_cmd)}",
+        ]
 
-    def _run(self, args: list[str]) -> subprocess.CompletedProcess:
-        return subprocess.run(self._argv(args), capture_output=True, text=True)
-
-    def _run_bytes(self, args: list[str], stdin_bytes: bytes | None = None) -> subprocess.CompletedProcess:
-        return subprocess.run(self._argv(args), input=stdin_bytes, capture_output=True)
+    def _sh(self, cmd: str, stdin_bytes: bytes | None = None) -> subprocess.CompletedProcess:
+        return subprocess.run(self._argv(cmd), input=stdin_bytes, capture_output=True)
 
     def q(self, *parts: str) -> str:
         return "/".join([self.queue, *parts])
 
     # --- файловые операции ------------------------------------------------
     def listdir(self, rel: str) -> list[str]:
-        r = self._run(["bash", "-lc", f"ls -1 {shlex.quote(self.q(rel))} 2>/dev/null"])
+        r = self._sh(f"ls -1 {shlex.quote(self.q(rel))} 2>/dev/null")
         if r.returncode != 0 or not r.stdout.strip():
             return []
-        return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+        return [ln.decode().strip() for ln in r.stdout.splitlines() if ln.strip()]
 
     def read_text(self, rel: str) -> str | None:
-        r = self._run(["cat", self.q(rel)])
-        return r.stdout if r.returncode == 0 else None
+        r = self._sh(f"cat {shlex.quote(self.q(rel))}")
+        if r.returncode != 0:
+            return None
+        return r.stdout.decode("utf-8", "replace")
 
     def write_text(self, rel: str, text: str) -> bool:
-        """Записать текст в файл очереди (результат задачи)."""
-        data = text.encode("utf-8")
-        if self.mode == "local":
-            p = pathlib.Path(self.q(rel))
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_bytes(data)
-            return True
-        cmd = (f"mkdir -p {shlex.quote(os.path.dirname(self.q(rel)))} && "
-               f"cat > {shlex.quote(self.q(rel))}")
-        r = self._run_bytes(["bash", "-lc", cmd], stdin_bytes=data)
+        """Записать текстовый файл в очередь (результат задачи)."""
+        path = self.q(rel)
+        r = self._sh(f"mkdir -p {shlex.quote(os.path.dirname(path))} && cat > {shlex.quote(path)}",
+                     stdin_bytes=text.encode("utf-8"))
         return r.returncode == 0
 
     def fetch_file(self, rel: str, dest: pathlib.Path) -> bool:
-        """Скачать файл (бинарно-безопасно: вложения бывают картинками)."""
+        """Скачать файл бинарно-безопасно (вложения бывают картинками)."""
         dest.parent.mkdir(parents=True, exist_ok=True)
-        if self.mode == "local":
-            src = pathlib.Path(self.q(rel))
-            if not src.is_file():
-                return False
-            shutil.copy2(src, dest)
-            return True
-        r = self._run_bytes(["cat", self.q(rel)])
+        r = self._sh(f"cat {shlex.quote(self.q(rel))}")
         if r.returncode != 0:
             return False
         dest.write_bytes(r.stdout)
         return True
 
     def push_file(self, rel: str, local: pathlib.Path) -> bool:
-        if self.mode == "local":
-            dest = pathlib.Path(self.q(rel))
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(local, dest)
-            return True
-        cmd = (f"mkdir -p {shlex.quote(os.path.dirname(self.q(rel)))} && "
-               f"cat > {shlex.quote(self.q(rel))}")
-        with open(local, "rb") as fh:
-            r = subprocess.run(
-                self._argv(["bash", "-lc", cmd]), stdin=fh, capture_output=True,
-            )
+        path = self.q(rel)
+        data = local.read_bytes()
+        r = self._sh(f"mkdir -p {shlex.quote(os.path.dirname(path))} && cat > {shlex.quote(path)}",
+                     stdin_bytes=data)
         return r.returncode == 0
+
+    def exists(self, rel: str) -> bool:
+        return self._sh(f"test -e {shlex.quote(self.q(rel))}").returncode == 0
 
     # --- протокол очереди -------------------------------------------------
     def claim(self, filename: str, worker: str) -> bool:
         """Атомарный захват: mv внутри одной ФС — это rename, race невозможен."""
-        r = self._run(["mv", self.q("inbox", filename), self.q("claimed", f"{filename}.{worker}")])
+        r = self._sh(f"mv {shlex.quote(self.q('inbox', filename))} "
+                     f"{shlex.quote(self.q('claimed', f'{filename}.{worker}'))}")
         return r.returncode == 0
 
     def heartbeat(self, filename: str, worker: str) -> None:
-        self._run(["touch", self.q("claimed", f"{filename}.{worker}")])
+        self._sh(f"touch {shlex.quote(self.q('claimed', f'{filename}.{worker}'))}")
 
     def drop_claim(self, filename: str, worker: str) -> None:
         """Снять claim после публикации результата. ВАЖНО: без этого бот решит,
         что воркер умер, и вернёт задачу в inbox — она выполнится второй раз."""
-        self._run(["rm", "-f", self.q("claimed", f"{filename}.{worker}")])
+        self._sh(f"rm -f {shlex.quote(self.q('claimed', f'{filename}.{worker}'))}")
 
     def release(self, filename: str, worker: str) -> None:
         """Вернуть задачу в inbox (например, битый JSON) — будет вторая попытка."""
-        self._run(["mv", self.q("claimed", f"{filename}.{worker}"), self.q("inbox", filename)])
+        self._sh(f"mv {shlex.quote(self.q('claimed', f'{filename}.{worker}'))} "
+                 f"{shlex.quote(self.q('inbox', filename))}")
 
     def quarantine(self, filename: str, worker: str) -> None:
         """Убрать задачу из оборота (нечитаемые данные, чтобы не зациклиться)."""
-        r = self._run(["bash", "-lc",
-                       f"mkdir -p {shlex.quote(self.q('done'))} && "
-                       f"mv {shlex.quote(self.q('claimed', f'{filename}.{worker}'))} "
-                       f"{shlex.quote(self.q('done', f'broken-{filename}'))}"])
+        r = self._sh(f"mkdir -p {shlex.quote(self.q('done'))} && "
+                     f"mv {shlex.quote(self.q('claimed', f'{filename}.{worker}'))} "
+                     f"{shlex.quote(self.q('done', f'broken-{filename}'))}")
         if r.returncode != 0:
             self.drop_claim(filename, worker)
+
+
+def selfcheck(args: argparse.Namespace, transport: Transport) -> int:
+    """Диагностика связи с очередью: видно ли задачи, есть ли права на запись.
+
+    Смысл — ловить именно такие ошибки, как неверное экранирование ssh-команды
+    или отсутствие прав: без этого поллер молча ничего не делает.
+    """
+    print(f"transport : {args.transport}")
+    print(f"host      : {args.host if args.transport == 'ssh' else '(локально)'}")
+    print(f"queue     : {transport.queue}")
+
+    ping = transport._sh("echo ok")
+    if ping.returncode != 0:
+        print(f"СВЯЗЬ     : ОШИБКА — {ping.stderr.decode('utf-8', 'replace').strip()[:200]}")
+        return 2
+    print("связь     : ok")
+
+    print(f"каталоги  : " + ", ".join(
+        f"{name}={len(transport.listdir(name))}" for name in ("inbox", "claimed", "outbox", "done")))
+
+    probe = f"files/.probe-{os.getpid()}"
+    if transport.write_text(probe, "probe"):
+        print("запись    : ok")
+        transport._sh(f"rm -f {shlex.quote(transport.q(probe))}")
+    else:
+        print("запись    : ОШИБКА — нет прав на каталог очереди")
+        return 2
+
+    inbox = [f for f in transport.listdir("inbox") if f.endswith(".json")]
+    if not inbox:
+        print("задачи    : очередь пуста")
+        return 0
+    for filename in sorted(inbox):
+        raw = transport.read_text(f"inbox/{filename}") or ""
+        try:
+            task = json.loads(raw)
+        except json.JSONDecodeError:
+            print(f"задачи    : {filename} — БИТЫЙ JSON")
+            continue
+        owner = str(task.get("worker") or "any")
+        mine = owner.lower() in ("any", args.worker)
+        print(f"задачи    : {filename} worker={owner} "
+              f"{'БЕРУ' if mine else 'не мой (ждёт ' + owner + ')'} "
+              f"| {(str(task.get('task') or '')[:60] or '(без текста)')}")
+    return 0
 
 
 def heartbeat_loop(transport: Transport, filename: str, worker: str, stop: threading.Event) -> None:
@@ -202,8 +243,51 @@ def build_prompt(task: dict, workdir: pathlib.Path) -> str:
     )
 
 
+BOX_TOP, BOX_BOTTOM = "╭", "╰"
+
+
+def clean_agent_output(raw: str) -> str:
+    """Срезать служебную обвязку Hermes CLI.
+
+    Основной режим — `-Q` (quiet): тогда на выходе чистый текст. Но версии и
+    конфиги бывают разные, поэтому дополнительно подчищаем:
+      - эхо промпта строкой «Query: ...» (иначе именно оно уезжало в чат);
+      - рамку ответа «╭─ ⚕ Hermes ─╮» (в обычном, не -Q режиме);
+      - футер «Resume this session with: …» и строки Session/Duration/Messages.
+    """
+    text = raw.replace("\r\n", "\n")
+
+    if BOX_TOP in text and BOX_BOTTOM in text:
+        inner, collecting = [], False
+        for line in text.split("\n"):
+            stripped = line.strip()
+            if not collecting:
+                if stripped.startswith(BOX_TOP):
+                    collecting = True
+                continue
+            if stripped.startswith(BOX_BOTTOM):
+                break
+            inner.append(line)
+        indents = [len(ln) - len(ln.lstrip()) for ln in inner if ln.strip()]
+        cut = min(indents) if indents else 0
+        text = "\n".join(ln[cut:] if len(ln) >= cut else ln for ln in inner)
+
+    lines = text.split("\n")
+    while lines and lines[0].startswith("Query: "):
+        lines.pop(0)
+    lines = [ln for ln in lines if not ln.startswith("Initializing agent")]
+    for i, ln in enumerate(lines):
+        if ln.startswith("Resume this session with:"):
+            lines = lines[:i]
+            break
+    lines = [ln for ln in lines if not ln.startswith(("Session:", "Duration:", "Messages:"))]
+    return "\n".join(lines).strip()
+
+
 def run_agent(args: argparse.Namespace, prompt: str, workdir: pathlib.Path) -> tuple[bool, str]:
-    cmd = [args.hermes, "chat", "-q", prompt]
+    # -Q (quiet) обязателен: без него stdout содержит эхо промпта, рамку и футер,
+    # и в Delta Chat уходила именно обвязка вместо ответа.
+    cmd = [args.hermes, "chat", "-Q", "-q", prompt]
     if args.model:
         cmd += ["-m", args.model]
     if args.yolo:
@@ -216,11 +300,11 @@ def run_agent(args: argparse.Namespace, prompt: str, workdir: pathlib.Path) -> t
         return False, f"таймаут выполнения ({args.timeout} с)"
     except FileNotFoundError:
         return False, f"не найден Hermes CLI: {args.hermes} (укажи --hermes)"
-    out = (proc.stdout or "").strip()
-    err = (proc.stderr or "").strip()
+    text = clean_agent_output(proc.stdout or "")
     if proc.returncode != 0:
-        return False, (out + "\n" + err).strip() or f"exit code {proc.returncode}"
-    return True, out
+        err = (proc.stderr or "").strip()
+        return False, (text + "\n" + err).strip() or f"exit code {proc.returncode}"
+    return True, text
 
 
 def handle_task(args: argparse.Namespace, transport: Transport, filename: str, raw: str) -> None:
@@ -329,6 +413,8 @@ def main() -> int:
     ap.add_argument("--timeout", type=int, default=1800, help="лимит на одну задачу, с")
     ap.add_argument("--workdir", default=None, help="каталог для временных файлов задач")
     ap.add_argument("--once", action="store_true", help="один проход и выход")
+    ap.add_argument("--check", action="store_true",
+                    help="диагностика: связь, права на запись, что лежит в очереди — и выход")
     ap.add_argument("--dry-run", action="store_true", help="не запускать агента")
     ap.add_argument("--yolo", action="store_true", help="передать --yolo в hermes")
     args = ap.parse_args()
@@ -343,6 +429,10 @@ def main() -> int:
         return 2
 
     log(f"worker={args.worker} transport={args.transport} host={args.host} queue={args.queue}")
+
+    if args.check:
+        return selfcheck(args, transport)
+
     while True:
         try:
             n = process_inbox(args, transport)
