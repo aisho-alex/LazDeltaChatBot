@@ -328,15 +328,20 @@ def clean_agent_output(raw: str) -> str:
 def run_agent(args: argparse.Namespace, prompt: str, workdir: pathlib.Path) -> tuple[bool, str]:
     # -Q (quiet) обязателен: без него stdout содержит эхо промпта, рамку и футер,
     # и в Delta Chat уходила именно обвязка вместо ответа.
-    cmd = [args.hermes, "chat", "-Q", "-q", prompt]
+    # shutil.which: на Windows CLI — это hermes.cmd/.exe, и подставить его как
+    # «hermes» из subprocess без расширения не всегда получается.
+    cmd = [shutil.which(args.hermes) or args.hermes, "chat", "-Q", "-q", prompt]
     if args.model:
         cmd += ["-m", args.model]
     if args.yolo:
         cmd.append("--yolo")
     log(f"running hermes chat -q (промпт {len(prompt)} символов)")
     try:
+        # encoding обязателен: на русской Windows text=True берёт кодировку
+        # консоли (cp1251), и ответы агента с кириллицей приезжали в чат
+        # кракозябрами. Hermes CLI пишет UTF-8.
         proc = subprocess.run(cmd, cwd=str(workdir), capture_output=True, text=True,
-                              timeout=args.timeout)
+                              encoding="utf-8", errors="replace", timeout=args.timeout)
     except subprocess.TimeoutExpired:
         return False, f"таймаут выполнения ({args.timeout} с)"
     except FileNotFoundError:
