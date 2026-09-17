@@ -88,6 +88,43 @@ begin
     Result := TJSONString.Create(S);
 end;
 
+{ MsgId из ответа ядра. Отвечать оно может по-разному: числом, массивом id
+  или объектом с полем msgId/id. Раньше мы жёстко брали AsQWord, и на массиве
+  падал разбор ответа misc_send_msg: вложение при этом уже уходило в чат, а в
+  журнал писалось «cannot send attachment … Cannot convert data from array
+  value» — то есть ошибка врала про потерянное вложение. }
+function JsonToMsgId(D: TJSONData): TMsgId;
+var
+  Arr: TJSONArray;
+  Obj: TJSONObject;
+  Sub: TJSONData;
+begin
+  Result := 0;
+  if not Assigned(D) or (D is TJSONNull) then Exit;
+  if D is TJSONArray then
+  begin
+    Arr := D as TJSONArray;
+    if Arr.Count > 0 then
+      Result := JsonToMsgId(Arr.Items[0]);
+    Exit;
+  end;
+  if D is TJSONObject then
+  begin
+    Obj := D as TJSONObject;
+    Sub := Obj.Find('msgId');
+    if not Assigned(Sub) then Sub := Obj.Find('id');
+    if Assigned(Sub) then
+      Result := JsonToMsgId(Sub);
+    Exit;
+  end;
+  try
+    Result := D.AsQWord;
+  except
+    on E: Exception do
+      Result := 0;
+  end;
+end;
+
 function GetAccount(Client: TDCClient): TAccountId;
 var
   Ids: TAccountIdArray;
@@ -292,7 +329,7 @@ begin
   Params.Add(ChatId);
   Params.Add(Text);
   Res := FRpc.CallResult('misc_send_text_message', Params);
-  Result := Res.AsQWord;
+  Result := JsonToMsgId(Res);
   Res.Free;
 end;
 
@@ -314,7 +351,7 @@ begin
   else
     Params.Add(TJSONNull.Create);
   Res := FRpc.CallResult('misc_send_msg', Params);
-  Result := Res.AsQWord;
+  Result := JsonToMsgId(Res);
   Res.Free;
 end;
 
