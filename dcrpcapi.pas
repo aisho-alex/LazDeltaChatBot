@@ -35,12 +35,58 @@ type
     procedure SetConfig(AccId: TAccountId; const Key: string; const Val: TOptionString);
     function GetMessage(AccId: TAccountId; MsgId: TMsgId): TMsgSnapshot;
     function MiscSendTextMessage(AccId: TAccountId; ChatId: TChatId; const Text: string): TMsgId;
+    { Send a message that may carry a file (7-argument RPC):
+      misc_send_msg(accountId, chatId, text, file, filename, location, quotedMessageId).
+      Empty strings are sent as JSON null; QuotedId = 0 means "no quote". }
+    function MiscSendMsg(AccId: TAccountId; ChatId: TChatId;
+      const Text, FilePath, FileName: string; QuotedId: TMsgId): TMsgId;
+    { Ask the core to fetch the full message (attachments of a not-yet-downloaded
+      message). The download itself is asynchronous: after this call the file
+      shows up in Message.file after a while, so poll GetMessage. }
+    procedure DownloadFullMessage(AccId: TAccountId; MsgId: TMsgId);
     property Rpc: TRpc read FRpc;
   end;
 
   function GetAccount(Client: TDCClient): TAccountId;
 
 implementation
+
+{ Tolerant JSON string extraction. deltachat-rpc-server returns these fields as
+  a plain string ("done"), JSON null, a number, or an enum-like object such as
+  viewType=Image / kind=Downloading; none of those may crash the bot — a crash
+  here would kill the core connection. }
+function JsonSafeStr(D: TJSONData): string;
+var
+  O: TJSONObject;
+  Sub: TJSONData;
+begin
+  Result := '';
+  if not Assigned(D) or (D is TJSONNull) then Exit;
+  if D is TJSONString then
+    Result := D.AsString
+  else if D is TJSONObject then
+  begin
+    O := D as TJSONObject;
+    Sub := O.Find('viewType');
+    if not Assigned(Sub) then Sub := O.Find('kind');
+    if not Assigned(Sub) then Sub := O.Find('type');
+    if Assigned(Sub) then
+      Result := JsonSafeStr(Sub)
+    else
+      Result := D.AsJSON;
+  end
+  else
+    Result := D.AsString;
+end;
+
+{ Optional RPC argument: '' becomes JSON null, otherwise a JSON string. }
+function OptStr(const S: string): TJSONData;
+begin
+  if S = '' then
+    Result := TJSONNull.Create
+  else
+    Result := TJSONString.Create(S);
+end;
 
 function GetAccount(Client: TDCClient): TAccountId;
 var
@@ -204,6 +250,7 @@ var
   Obj: TJSONObject;
   D: TJSONData;
 begin
+  Result := Default(TMsgSnapshot);
   Params := TJSONArray.Create;
   Params.Add(AccId);
   Params.Add(MsgId);
@@ -216,11 +263,22 @@ begin
   D := Obj.Find('fromId');
   if Assigned(D) then Result.FromId := D.AsQWord else Result.FromId := 0;
   D := Obj.Find('text');
-  if Assigned(D) then Result.Text := D.AsString else Result.Text := '';
+  if Assigned(D) and not (D is TJSONNull) then Result.Text := D.AsString else Result.Text := '';
   D := Obj.Find('isBot');
   if Assigned(D) then Result.IsBot := D.AsBoolean else Result.IsBot := False;
   D := Obj.Find('isInfo');
   if Assigned(D) then Result.IsInfo := D.AsBoolean else Result.IsInfo := False;
+  // --- attachments ---
+  D := Obj.Find('file');
+  if Assigned(D) and not (D is TJSONNull) then Result.FilePath := D.AsString;
+  D := Obj.Find('fileName');
+  if Assigned(D) and not (D is TJSONNull) then Result.FileName := D.AsString;
+  D := Obj.Find('fileMime');
+  if Assigned(D) and not (D is TJSONNull) then Result.FileMime := D.AsString;
+  D := Obj.Find('fileBytes');
+  if Assigned(D) and not (D is TJSONNull) then Result.FileBytes := D.AsInt64;
+  Result.ViewType := JsonSafeStr(Obj.Find('viewType'));
+  Result.DownloadState := JsonSafeStr(Obj.Find('downloadState'));
   Res.Free;
 end;
 
@@ -235,6 +293,40 @@ begin
   Params.Add(Text);
   Res := FRpc.CallResult('misc_send_text_message', Params);
   Result := Res.AsQWord;
+  Res.Free;
+end;
+
+function TDCClient.MiscSendMsg(AccId: TAccountId; ChatId: TChatId;
+  const Text, FilePath, FileName: string; QuotedId: TMsgId): TMsgId;
+var
+  Params: TJSONArray;
+  Res: TJSONData;
+begin
+  Params := TJSONArray.Create;
+  Params.Add(AccId);
+  Params.Add(ChatId);
+  Params.Add(OptStr(Text));
+  Params.Add(OptStr(FilePath));
+  Params.Add(OptStr(FileName));
+  Params.Add(TJSONNull.Create);          // location (unused)
+  if QuotedId > 0 then
+    Params.Add(QuotedId)
+  else
+    Params.Add(TJSONNull.Create);
+  Res := FRpc.CallResult('misc_send_msg', Params);
+  Result := Res.AsQWord;
+  Res.Free;
+end;
+
+procedure TDCClient.DownloadFullMessage(AccId: TAccountId; MsgId: TMsgId);
+var
+  Params: TJSONArray;
+  Res: TJSONData;
+begin
+  Params := TJSONArray.Create;
+  Params.Add(AccId);
+  Params.Add(MsgId);
+  Res := FRpc.CallResult('download_full_message', Params);
   Res.Free;
 end;
 
