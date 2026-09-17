@@ -254,6 +254,28 @@ def build_prompt(task: dict, workdir: pathlib.Path) -> str:
 
 BOX_TOP, BOX_BOTTOM = "╭", "╰"
 
+# Признаки того, что агент упёрся в подтверждение опасной команды: в
+# неинтерактивном запуске (hermes chat -q) ответить на запрос некому, через
+# approvals.timeout приходит отказ, и работа встаёт. Без этой проверки в чат
+# уезжает «задача не выполнена», и причина не видна.
+APPROVAL_SIGNS = (
+    "DANGEROUS COMMAND",
+    "Timeout - denying command",
+    "denying command",
+    "requires approval",
+)
+
+
+def looks_like_approval_denial(raw: str) -> bool:
+    return any(sign in raw for sign in APPROVAL_SIGNS)
+
+
+APPROVAL_HINT = (
+    "⛔ Часть команд упёрлась в подтверждение (approvals.mode=manual): "
+    "в неинтерактивном запуске отвечать некому, запрос истекает как отказ. "
+    "Запусти поллер с --yolo или включи approvals.mode smart."
+)
+
 
 def clean_agent_output(raw: str) -> str:
     """Срезать служебную обвязку Hermes CLI.
@@ -262,9 +284,18 @@ def clean_agent_output(raw: str) -> str:
     конфиги бывают разные, поэтому дополнительно подчищаем:
       - эхо промпта строкой «Query: ...» (иначе именно оно уезжало в чат);
       - рамку ответа «╭─ ⚕ Hermes ─╮» (в обычном, не -Q режиме);
-      - футер «Resume this session with: …» и строки Session/Duration/Messages.
+      - футер «Resume this session with: …» и строки Session/Duration/Messages;
+      - строку «session_id: …» (её печатает CLI даже с -Q) и хвост аварийного
+        завершения интерпретатора («Fatal Python error: …») — он появляется,
+        когда поток подтверждения держит stdin при выходе, и уезжал в чат
+        вместо ответа.
     """
     text = raw.replace("\r\n", "\n")
+
+    for marker in ("Fatal Python error:", "Python runtime state:"):
+        cut = text.find(marker)
+        if cut != -1:
+            text = text[:cut]
 
     if BOX_TOP in text and BOX_BOTTOM in text:
         inner, collecting = [], False
@@ -289,7 +320,8 @@ def clean_agent_output(raw: str) -> str:
         if ln.startswith("Resume this session with:"):
             lines = lines[:i]
             break
-    lines = [ln for ln in lines if not ln.startswith(("Session:", "Duration:", "Messages:"))]
+    lines = [ln for ln in lines
+             if not ln.startswith(("Session:", "Duration:", "Messages:", "session_id:"))]
     return "\n".join(lines).strip()
 
 
@@ -310,9 +342,14 @@ def run_agent(args: argparse.Namespace, prompt: str, workdir: pathlib.Path) -> t
     except FileNotFoundError:
         return False, f"не найден Hermes CLI: {args.hermes} (укажи --hermes)"
     text = clean_agent_output(proc.stdout or "")
+    raw_out = (proc.stdout or "") + "\n" + (proc.stderr or "")
     if proc.returncode != 0:
+        if looks_like_approval_denial(raw_out):
+            return False, "\n".join(x for x in (text, APPROVAL_HINT) if x.strip())
         err = (proc.stderr or "").strip()
         return False, (text + "\n" + err).strip() or f"exit code {proc.returncode}"
+    if looks_like_approval_denial(raw_out):
+        text = (text + "\n" + APPROVAL_HINT).strip()
     return True, text
 
 
