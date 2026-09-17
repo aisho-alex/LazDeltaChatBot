@@ -29,6 +29,7 @@ import argparse
 import json
 import os
 import pathlib
+import re
 import shlex
 import shutil
 import subprocess
@@ -48,6 +49,8 @@ PROMPT_TEMPLATE = """[Задача от Алекса через Delta Chat]
 Инструкция:
 - Выполни задачу по-максимуму: инструменты, терминал, файлы, браузер — всё доступно.
 - Ответь КОРОТКО (1-3 строки): это уйдёт в чат Delta Chat, канал медленный.
+- Не печатай локальные пути и не повторяй в ответе содержимое файлов: отчёт уедет
+  вложением, а в чат нужен только вывод в 1-3 строки.
 - Подробности, отчёты и большие тексты пиши ФАЙЛОМ в каталог: {outdir}
   Всё, что появится в этом каталоге, уедет в чат вложениями.
 - Если что-то не получилось — скажи коротко, что именно.
@@ -253,6 +256,7 @@ def build_prompt(task: dict, workdir: pathlib.Path) -> str:
 
 
 BOX_TOP, BOX_BOTTOM = "╭", "╰"
+PROGRESS_GLYPH = "┊"   # префикс строк прогресса инструментов в CLI
 
 # Признаки того, что агент упёрся в подтверждение опасной команды: в
 # неинтерактивном запуске (hermes chat -q) ответить на запрос некому, через
@@ -312,6 +316,21 @@ def clean_agent_output(raw: str) -> str:
         cut = min(indents) if indents else 0
         text = "\n".join(ln[cut:] if len(ln) >= cut else ln for ln in inner)
 
+    # Прогресс инструментов. `-Q` глушит баннер и спиннер, но не эти блоки: в
+    # некоторых версиях CLI на stdout попадают строки «┊ review diff …» вместе с
+    # полным содержимым файла. В чат уезжал diff (и полезный ответ обрезался
+    # лимитом), поэтому отбрасываем всё до последней такой строки — ответ идёт
+    # после неё.
+    if PROGRESS_GLYPH in text:
+        lines = text.split("\n")
+        last = -1
+        for i, ln in enumerate(lines):
+            if ln.startswith(PROGRESS_GLYPH):
+                last = i
+        tail = "\n".join(lines[last + 1:]).strip()
+        if tail:
+            text = tail
+
     lines = text.split("\n")
     while lines and lines[0].startswith("Query: "):
         lines.pop(0)
@@ -323,6 +342,48 @@ def clean_agent_output(raw: str) -> str:
     lines = [ln for ln in lines
              if not ln.startswith(("Session:", "Duration:", "Messages:", "session_id:"))]
     return "\n".join(lines).strip()
+
+
+SESSION_ID_RE = re.compile(r"^session_id:\s*(\S+)\s*$", re.M)
+
+
+def sessions_dir() -> pathlib.Path:
+    home = os.environ.get("HERMES_HOME") or str(pathlib.Path.home() / ".hermes")
+    return pathlib.Path(home) / "sessions"
+
+
+def answer_from_session(raw: str) -> str:
+    """Финальный ответ агента — из файла сессии, а не из stdout.
+
+    stdout ненадёжен: `-Q` глушит баннер, но не блоки «┊ review diff …» с полным
+    содержимым файлов, поэтому в чат уезжал diff вместо ответа. CLI печатает
+    строку `session_id: <id>` — по ней находим ~/.hermes/sessions/session_<id>.json
+    и берём последнее непустое сообщение ассистента: это ровно тот текст, который
+    агент считает своим ответом.
+    """
+    m = SESSION_ID_RE.search(raw)
+    if not m:
+        return ""
+    path = sessions_dir() / f"session_{m.group(1)}.json"
+    for _ in range(5):          # файл может дописываться в момент выхода процесса
+        if path.is_file():
+            break
+        time.sleep(0.3)
+    if not path.is_file():
+        return ""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    msgs = data.get("messages") if isinstance(data, dict) else None
+    if not isinstance(msgs, list):
+        return ""
+    for msg in reversed(msgs):
+        if isinstance(msg, dict) and msg.get("role") == "assistant":
+            content = msg.get("content")
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+    return ""
 
 
 def run_agent(args: argparse.Namespace, prompt: str, workdir: pathlib.Path) -> tuple[bool, str]:
@@ -347,6 +408,9 @@ def run_agent(args: argparse.Namespace, prompt: str, workdir: pathlib.Path) -> t
     except FileNotFoundError:
         return False, f"не найден Hermes CLI: {args.hermes} (укажи --hermes)"
     text = clean_agent_output(proc.stdout or "")
+    # Приоритет — ответ из файла сессии: stdout может содержать прогресс
+    # инструментов (diff'ы файлов), из-за чего в чат уезжал мусор.
+    text = answer_from_session(proc.stdout or "") or text
     raw_out = (proc.stdout or "") + "\n" + (proc.stderr or "")
     if proc.returncode != 0:
         if looks_like_approval_denial(raw_out):
