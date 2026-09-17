@@ -232,50 +232,13 @@ begin
     [Id, S.ChatId, Worker, Length(Att), Length(TaskText)]));
 end;
 
-{ Свои сообщения, отправленные из потока очереди, core не всегда «будит»
-  событием, и главный цикл про них не узнаёт: они остаются в get_next_msgs,
-  watchdog через два опроса решает, что поток событий сломан, и перезапускает
-  бота. Поэтому после отправки сами помечаем СВОИ сообщения обработанными —
-  но только если среди ожидающих нет чужих: иначе можно проглотить входящую
-  команду, которая ждёт обработки главным циклом. }
-procedure MarkOwnSent(LastId: TMsgId);
-var
-  Ids: TMsgIdArray;
-  S: TMsgSnapshot;
-  i, MaxId: Integer;
-begin
-  if LastId = 0 then Exit;
-  try
-    Ids := Client.GetNextMsgs(AccId);
-    if Length(Ids) = 0 then Exit;
-    MaxId := 0;
-    for i := Low(Ids) to High(Ids) do
-    begin
-      if Ids[i] > MaxId then MaxId := Ids[i];
-      if Ids[i] = LastId then Continue; // только что отправленное нами
-      S := Client.GetMessage(AccId, Ids[i]);
-      if S.IsBot and (S.FromId = ContactSelf) then Continue; // тоже наше
-      WriteLn(Format('DEBUG queue: msg %d не наше (from=%d isBot=%s) — last_msg_id не трогаю',
-        [Ids[i], S.FromId, BoolToStr(S.IsBot, True)]));
-      Exit;
-    end;
-    Client.SetConfig(AccId, 'last_msg_id', SomeStr(IntToStr(MaxId)));
-    WriteLn(Format('DEBUG queue: свои сообщения до %d отмечены обработанными', [MaxId]));
-  except
-    on E: Exception do
-      WriteLn(StdErr, 'WARN: MarkOwnSent: ' + E.Message);
-  end;
-end;
-
 { Доставка результата задачи: короткий текст + файлы-вложения.
   Вызывается из потока очереди; RPC потокобезопасен (critical section). }
 procedure DeliverResult(const Res: TTaskResult);
 var
   i: Integer;
   Abs, Text: string;
-  LastId, Id: TMsgId;
 begin
-  LastId := 0;
   Text := Res.Text;
   if Length(Text) > 3500 then
     Text := Copy(Text, 1, 3500) + LineEnding + '(сокращено — полностью в файле)';
@@ -283,8 +246,7 @@ begin
     Text := '⚠️ Задача ' + Res.Id + ' не выполнена' + LineEnding + Text;
   if Trim(Text) = '' then
     Text := '✅ Задача ' + Res.Id + ' выполнена (воркер ' + Res.Worker + ')';
-  Id := Client.MiscSendTextMessage(AccId, Res.ChatId, LLM.SanitizeUtf8(Text));
-  if Id > LastId then LastId := Id;
+  SendMsg(AccId, Res.ChatId, Text);
   for i := 0 to High(Res.Attachments) do
   begin
     Abs := IncludeTrailingPathDelimiter(Queue.Root) + Res.Attachments[i].RelPath;
@@ -294,15 +256,13 @@ begin
       Continue;
     end;
     try
-      Id := Client.MiscSendMsg(AccId, Res.ChatId, '', Abs, Res.Attachments[i].Name, 0);
-      if Id > LastId then LastId := Id;
+      Client.MiscSendMsg(AccId, Res.ChatId, '', Abs, Res.Attachments[i].Name, 0);
       WriteLn(Format('DEBUG sent attachment %s to chat %d', [Abs, Res.ChatId]));
     except
       on E: Exception do
         WriteLn(StdErr, 'ERROR: cannot send attachment ' + Abs + ': ' + E.Message);
     end;
   end;
-  MarkOwnSent(LastId);
 end;
 
 procedure HandleNewMsg(AccId: TAccountId; MsgId: TMsgId);
