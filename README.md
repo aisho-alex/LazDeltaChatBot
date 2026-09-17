@@ -275,6 +275,41 @@ Task Scheduler на Windows).
 | `QUEUE_CONTEXT_MSGS` | сколько последних реплик чата прикладывать к задаче | `3` |
 | `QUEUE_WORKER_NAME` | имя воркера для отображения в `/status` | *(пусто)* |
 
+### Автозапуск воркера
+
+Воркер — обычный процесс, который живёт на машине постоянно и опрашивает очередь.
+На Linux это systemd-юнит пользователя:
+
+```ini
+# ~/.config/systemd/user/dc-agent-worker.service
+[Unit]
+Description=Delta Chat agent worker (Hermes)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/workspace/LazDeltaChatBot
+ExecStart=/usr/bin/python3 %h/workspace/LazDeltaChatBot/scripts/agent_poller.py --worker laptop --interval 60
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=default.target
+```
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now dc-agent-worker
+sudo loginctl enable-linger $USER     # иначе юнит умрёт при выходе из ssh
+journalctl --user -u dc-agent-worker -f
+```
+
+На Windows — задача в Планировщике: триггер «при входе пользователя», действие
+`python.exe scripts\agent_poller.py --worker pc --interval 60`, вывод в файл
+через `>> %TEMP%\dc-agent-worker.log 2>&1`. Отдельный терминал для этого
+не нужен, но и «настоящей службы» не будет: агент живёт, пока идёт сессия
+пользователя.
+
 ### Предостережения
 
 - Задача без воркера не теряется, но и не выполняется: она лежит в `inbox` и
