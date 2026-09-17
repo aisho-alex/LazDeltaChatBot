@@ -258,6 +258,11 @@ def build_prompt(task: dict, workdir: pathlib.Path) -> str:
 BOX_TOP, BOX_BOTTOM = "╭", "╰"
 PROGRESS_GLYPH = "┊"   # префикс строк прогресса инструментов в CLI
 
+# Тело блока прогресса «┊ review diff»: строка-переименование «a/x → b/x»,
+# заголовок дифа или его строки. Нужно, чтобы срезать тело ПОСЛЕДНЕГО блока:
+# по строкам «┊» оно не попадает, а в чат уезжает вместе с ответом.
+DIFF_START_RE = re.compile(r"^\s*(a/.+→ b/|diff --git |@@ |\+\+\+ |--- |Index: )")
+
 # Признаки того, что агент упёрся в подтверждение опасной команды: в
 # неинтерактивном запуске (hermes chat -q) ответить на запрос некому, через
 # approvals.timeout приходит отказ, и работа встаёт. Без этой проверки в чат
@@ -330,6 +335,24 @@ def clean_agent_output(raw: str) -> str:
         tail = "\n".join(lines[last + 1:]).strip()
         if tail:
             text = tail
+
+    # Тело последнего блока прогресса остаётся перед ответом: срезаем ведущую
+    # последовательность строк дифа и останавливаемся на первой «нормальной».
+    lines = text.split("\n")
+    i = 0
+    in_diff = False
+    while i < len(lines):
+        line = lines[i]
+        if DIFF_START_RE.match(line):
+            in_diff = True
+            i += 1
+            continue
+        if in_diff and (line.strip() == "" or line.strip()[0] in "+- "):
+            i += 1
+            continue
+        break
+    if i:
+        text = "\n".join(lines[i:]).strip()
 
     lines = text.split("\n")
     while lines and lines[0].startswith("Query: "):
@@ -407,11 +430,13 @@ def run_agent(args: argparse.Namespace, prompt: str, workdir: pathlib.Path) -> t
         return False, f"таймаут выполнения ({args.timeout} с)"
     except FileNotFoundError:
         return False, f"не найден Hermes CLI: {args.hermes} (укажи --hermes)"
+    raw_out = (proc.stdout or "") + "\n" + (proc.stderr or "")
     text = clean_agent_output(proc.stdout or "")
     # Приоритет — ответ из файла сессии: stdout может содержать прогресс
     # инструментов (diff'ы файлов), из-за чего в чат уезжал мусор.
-    text = answer_from_session(proc.stdout or "") or text
-    raw_out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    # Строку `session_id:` CLI пишет в STDERR, поэтому искать надо в обоих
+    # потоках — на одном stdout поиск молча не находит ничего.
+    text = answer_from_session(raw_out) or text
     if proc.returncode != 0:
         if looks_like_approval_denial(raw_out):
             return False, "\n".join(x for x in (text, APPROVAL_HINT) if x.strip())
