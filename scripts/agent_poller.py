@@ -106,10 +106,19 @@ class Transport:
         return r.stdout.decode("utf-8", "replace")
 
     def write_text(self, rel: str, text: str) -> bool:
-        """Записать текстовый файл в очередь (результат задачи)."""
+        """Записать текстовый файл в очередь атомарно (tmp + mv).
+
+        Результат читает бот: если воркер умер посреди записи, полупустой файл
+        бот отправит как «broken» и результат потеряется. mv поверх — атомарен.
+        """
         path = self.q(rel)
-        r = self._sh(f"mkdir -p {shlex.quote(os.path.dirname(path))} && cat > {shlex.quote(path)}",
-                     stdin_bytes=text.encode("utf-8"))
+        tmp = f"{path}.tmp-{os.getpid()}"
+        data = text.encode("utf-8")
+        r = self._sh(f"mkdir -p {shlex.quote(os.path.dirname(path))} && "
+                     f"cat > {shlex.quote(tmp)} && mv -f {shlex.quote(tmp)} {shlex.quote(path)}",
+                     stdin_bytes=data)
+        if r.returncode != 0:
+            self._sh(f"rm -f {shlex.quote(tmp)}")
         return r.returncode == 0
 
     def fetch_file(self, rel: str, dest: pathlib.Path) -> bool:
