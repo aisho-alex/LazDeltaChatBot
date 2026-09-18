@@ -44,6 +44,10 @@ type
       message). The download itself is asynchronous: after this call the file
       shows up in Message.file after a while, so poll GetMessage. }
     procedure DownloadFullMessage(AccId: TAccountId; MsgId: TMsgId);
+    { SecureJoin (штатное приглашение Delta Chat). Ядро проверяет приглашение,
+      запускает рукопожатие В ФОНЕ и сразу возвращает id чата, в который идёт
+      вход. Результат (verified-контакт, шифрование) появляется позже сам. }
+    function SecureJoin(AccId: TAccountId; const Qr: string): TChatId;
     property Rpc: TRpc read FRpc;
   end;
 
@@ -329,6 +333,19 @@ begin
   Params.Add(ChatId);
   Params.Add(Text);
   Res := FRpc.CallResult('misc_send_text_message', Params);
+  Result := JsonToMsgId(Res);
+  Res.Free;
+end;
+
+function TDCClient.SecureJoin(AccId: TAccountId; const Qr: string): TChatId;
+var
+  Params: TJSONArray;
+  Res: TJSONData;
+begin
+  Params := TJSONArray.Create;
+  Params.Add(AccId);
+  Params.Add(Qr);
+  Res := FRpc.CallResult('secure_join', Params);
   Result := JsonToMsgId(Res);
   Res.Free;
 end;

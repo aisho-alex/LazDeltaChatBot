@@ -271,6 +271,7 @@ var
   Text, Reply, Code: string;
   M, Q, Kind, W: string;
   P: Integer;
+  CId: TChatId;
 begin
   Snap := Client.GetMessage(AccId, MsgId);
   WriteLn(Format('DEBUG msg id=%d chat=%d from=%d isBot=%s isInfo=%s view=%s state=%s bytes=%d file="%s" text="%s"',
@@ -310,6 +311,41 @@ begin
     Exit;
   end;
 
+  // --- SecureJoin: приём приглашения Delta Chat (verified-контакт + E2EE) ---
+  if (Copy(Text, 1, 6) = '/join ') or (Pos('i.delta.chat/#', Text) > 0)
+    or (Pos('OPENPGP4FPR:', Text) > 0) then
+  begin
+    Q := Text;
+    if Copy(Text, 1, 6) = '/join ' then
+      Q := Trim(Copy(Text, 7, Length(Text) - 6));
+    P := Pos('https://i.delta.chat/#', Q);
+    if P = 0 then
+      P := Pos('OPENPGP4FPR:', Q);
+    if P = 0 then
+      Reply := 'Не вижу ссылку-приглашение. Формат: /join https://i.delta.chat/#…'
+    else
+    begin
+      Q := Trim(Copy(Q, P, Length(Q) - P + 1));
+      P := Pos(' ', Q);
+      if P > 0 then
+        Q := Copy(Q, 1, P - 1);
+      WriteLn(Format('DEBUG secure_join: приглашение длиной %d символов, чат=%d',
+        [Length(Q), Snap.ChatId]));
+      Flush(Output);
+      try
+        CId := Client.SecureJoin(AccId, Q);
+        Reply := Format('🔐 Приглашение принято (чат %d). Рукопожатие идёт в фоне: ' +
+          'через несколько секунд контакт станет проверенным, и переписка пойдёт ' +
+          'зашифрованной — в чате появится признак шифрования.', [CId]);
+      except
+        on E: Exception do
+          Reply := '❌ SecureJoin не сработал: ' + E.Message;
+      end;
+    end;
+    SendMsg(AccId, Snap.ChatId, Reply);
+    Exit;
+  end;
+
   // --- bot commands ---
   if Text = '/help' then
   begin
@@ -322,6 +358,7 @@ begin
       '/search <запрос> — поиск в интернете' + LineEnding +
       '/search tg <запрос> — поиск по Telegram-каналам' + LineEnding +
       '/search crawl <url> — обойти сайт' + LineEnding +
+      '/join <ссылка-приглашение> — принять SecureJoin (шифрованный контакт)' + LineEnding +
       '/clear — очистить контекст чата' + LineEnding +
       '  (для Drift — создать новую сессию)' + LineEnding +
       LineEnding +
